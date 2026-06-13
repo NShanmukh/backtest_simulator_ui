@@ -1,0 +1,110 @@
+/**
+ * App — root component for the Backtesting Dashboard.
+ * Orchestrates FilterBar, Charts, PnLSummary, and ResultsTable,
+ * managing the backtest request lifecycle and error display.
+ */
+
+import React, { useState } from "react";
+import { Layout, Typography, Alert, Spin, ConfigProvider, theme } from "antd";
+import FilterBar from "./components/FilterBar";
+import ResultsTable from "./components/ResultsTable";
+import PnLSummary from "./components/PnLSummary";
+import Charts from "./components/Charts";
+import { runBacktest } from "./api/backtest";
+import type { BacktestRequest, BacktestResponse } from "./types";
+
+const { Header, Content, Footer } = Layout;
+const { Title } = Typography;
+
+const App: React.FC = () => {
+  // Backtest state
+  const [result, setResult] = useState<BacktestResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  /** Trigger a backtest via the API and store the result */
+  const handleRun = async (req: BacktestRequest) => {
+    setLoading(true);
+    setError(null);
+    setResult(null);
+
+    try {
+      const data = await runBacktest(req);
+      setResult(data);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      setError(msg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <ConfigProvider
+      theme={{
+        algorithm: theme.defaultAlgorithm,
+        token: { colorPrimary: "#1677ff" },
+      }}
+    >
+      <Layout style={{ minHeight: "100vh" }}>
+        {/* App header */}
+        <Header
+          style={{
+            background: "#001529",
+            display: "flex",
+            alignItems: "center",
+            padding: "0 24px",
+          }}
+        >
+          <Title level={3} style={{ color: "#fff", margin: 0 }}>
+            Options Backtesting Dashboard
+          </Title>
+        </Header>
+
+        <Content style={{ padding: "24px 24px 0" }}>
+          {/* Filter controls */}
+          <FilterBar onRun={handleRun} loading={loading} />
+
+          {/* Error alert */}
+          {error && (
+            <Alert
+              message="Backtest Error"
+              description={error}
+              type="error"
+              showIcon
+              closable
+              style={{ marginBottom: 16 }}
+              onClose={() => setError(null)}
+            />
+          )}
+
+          {/* Loading spinner */}
+          {loading && (
+            <div style={{ textAlign: "center", padding: 48 }}>
+              <Spin size="large" tip="Running backtest…" />
+            </div>
+          )}
+
+          {/* Results: charts, summary card, and data table */}
+          {result && !loading && (
+            <>
+              <Charts rows={result.rows} />
+              <PnLSummary
+                rows={result.rows}
+                totalPnl={result.total_pnl}
+                symbol={result.symbol}
+              />
+              <ResultsTable rows={result.rows} totalPnl={result.total_pnl} />
+            </>
+          )}
+        </Content>
+
+        <Footer style={{ textAlign: "center" }}>
+          Backtesting Dashboard · Built with FastAPI + React + Ant Design
+        </Footer>
+      </Layout>
+    </ConfigProvider>
+  );
+};
+
+export default App;
