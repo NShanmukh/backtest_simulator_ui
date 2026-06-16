@@ -57,3 +57,28 @@ export interface PricePoint {
   date: string;
   close_price: number;
 }
+
+/** Input object for options analyzer */
+export interface OptionsInput {
+  expiryDate: string; // YYYY-MM-DD format
+  date: string; // YYYY-MM-DD format (start date)
+  strikePrice: number;
+  symbol: string;
+}
+
+/** Premium data for a specific strike and date */
+export interface StrikePremium {
+  expiryDate: string;
+  strike: number;
+  closePrice: number;
+}
+
+/** Result row for options analyzer table */
+export interface OptionsAnalysisRow {
+  date: string;
+  closingPrice: number;
+  ceStrike: number;
+  peStrike: number;
+  cePremiumData: StrikePremium | null; // Expiry date, strike, close price
+  pePremiumData: StrikePremium | null;
+}

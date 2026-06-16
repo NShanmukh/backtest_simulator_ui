@@ -13,7 +13,7 @@ export default defineConfig({
     // Proxy API calls to the FastAPI backend at port 8000
     proxy: {
       "/api": {
-        target: "http://localhost:8000",
+        target: "http://127.0.0.1:8000",
         changeOrigin: true,
       },
     },

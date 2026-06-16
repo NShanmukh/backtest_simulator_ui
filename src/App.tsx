@@ -5,11 +5,12 @@
  */
 
 import React, { useState } from "react";
-import { Layout, Typography, Alert, Spin, ConfigProvider, theme } from "antd";
+import { Layout, Typography, Alert, Spin, ConfigProvider, theme, Tabs } from "antd";
 import FilterBar from "./components/FilterBar";
 import ResultsTable from "./components/ResultsTable";
 import PnLSummary from "./components/PnLSummary";
 import Charts from "./components/Charts";
+import OptionsAnalyzer from "./components/OptionsAnalyzer";
 import { runBacktest } from "./api/backtest";
 import type { BacktestRequest, BacktestResponse } from "./types";
 
@@ -21,6 +22,7 @@ const App: React.FC = () => {
   const [result, setResult] = useState<BacktestResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState("backtest");
 
   /** Trigger a backtest via the API and store the result */
   const handleRun = async (req: BacktestRequest) => {
@@ -62,41 +64,61 @@ const App: React.FC = () => {
         </Header>
 
         <Content style={{ padding: "24px 24px 0" }}>
-          {/* Filter controls */}
-          <FilterBar onRun={handleRun} loading={loading} />
+          {/* Tab navigation */}
+          <Tabs
+            activeKey={activeTab}
+            onChange={setActiveTab}
+            items={[
+              {
+                key: "backtest",
+                label: "Backtest",
+                children: (
+                  <>
+                    {/* Filter controls */}
+                    <FilterBar onRun={handleRun} loading={loading} />
 
-          {/* Error alert */}
-          {error && (
-            <Alert
-              message="Backtest Error"
-              description={error}
-              type="error"
-              showIcon
-              closable
-              style={{ marginBottom: 16 }}
-              onClose={() => setError(null)}
-            />
-          )}
+                    {/* Error alert */}
+                    {error && (
+                      <Alert
+                        message="Backtest Error"
+                        description={error}
+                        type="error"
+                        showIcon
+                        closable
+                        style={{ marginBottom: 16 }}
+                        onClose={() => setError(null)}
+                      />
+                    )}
 
-          {/* Loading spinner */}
-          {loading && (
-            <div style={{ textAlign: "center", padding: 48 }}>
-              <Spin size="large" tip="Running backtest…" />
-            </div>
-          )}
+                    {/* Loading spinner */}
+                    {loading && (
+                      <div style={{ textAlign: "center", padding: 48 }}>
+                        <Spin size="large" tip="Running backtest…" />
+                      </div>
+                    )}
 
-          {/* Results: charts, summary card, and data table */}
-          {result && !loading && (
-            <>
-              <Charts rows={result.rows} />
-              <PnLSummary
-                rows={result.rows}
-                totalPnl={result.total_pnl}
-                symbol={result.symbol}
-              />
-              <ResultsTable rows={result.rows} totalPnl={result.total_pnl} />
-            </>
-          )}
+                    {/* Results: charts, summary card, and data table */}
+                    {result && !loading && (
+                      <>
+                        <Charts rows={result.rows} />
+                        <PnLSummary
+                          rows={result.rows}
+                          totalPnl={result.total_pnl}
+                          symbol={result.symbol}
+                        />
+                        <ResultsTable rows={result.rows} totalPnl={result.total_pnl} />
+                      </>
+                    )}
+                  </>
+                ),
+              },
+              {
+                key: "options-analyzer",
+                label: "Options Analyzer",
+                children: <OptionsAnalyzer />,
+              },
+            ]}
+          />
         </Content>
 
         <Footer style={{ textAlign: "center" }}>
