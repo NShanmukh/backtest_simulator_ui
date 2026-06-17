@@ -8,6 +8,8 @@ import type { BacktestRequest, BacktestResponse, PricePoint } from "../types";
 export interface OptionOpenClose {
   openPrice: number | null;
   closePrice: number | null;
+  delta: number | null;
+  theta: number | null;
   statusCode: number | null;
 }
 
@@ -95,19 +97,35 @@ export async function fetchOptionOpenClose(
     
     if (!res.ok) {
       console.warn(`Failed to fetch option price for ${optionSymbol} on ${date}: ${res.status}`);
-      return { openPrice: null, closePrice: null, statusCode: res.status };
+      return {
+        openPrice: null,
+        closePrice: null,
+        delta: null,
+        theta: null,
+        statusCode: res.status,
+      };
     }
     
     const data = await res.json();
+
+    const greeks = data.greeks ?? data.results?.greeks ?? null;
     
     return {
       openPrice: data.open ?? data.o ?? null,
       closePrice: data.close ?? data.c ?? null,
+      delta: greeks?.delta ?? data.delta ?? null,
+      theta: greeks?.theta ?? data.theta ?? null,
       statusCode: res.status,
     };
   } catch (error) {
     console.error(`Error fetching option price:`, error);
-    return { openPrice: null, closePrice: null, statusCode: null };
+    return {
+      openPrice: null,
+      closePrice: null,
+      delta: null,
+      theta: null,
+      statusCode: null,
+    };
   }
 }
 
@@ -125,7 +143,13 @@ export async function fetchStockOpenClose(
 
     if (!res.ok) {
       console.warn(`Failed to fetch stock price for ${symbol} on ${date}: ${res.status}`);
-      return { openPrice: null, closePrice: null, statusCode: res.status };
+      return {
+        openPrice: null,
+        closePrice: null,
+        delta: null,
+        theta: null,
+        statusCode: res.status,
+      };
     }
 
     const data = await res.json();
@@ -133,10 +157,18 @@ export async function fetchStockOpenClose(
     return {
       openPrice: data.open ?? data.o ?? null,
       closePrice: data.close ?? data.c ?? null,
+      delta: null,
+      theta: null,
       statusCode: res.status,
     };
   } catch (error) {
     console.error(`Error fetching stock price:`, error);
-    return { openPrice: null, closePrice: null, statusCode: null };
+    return {
+      openPrice: null,
+      closePrice: null,
+      delta: null,
+      theta: null,
+      statusCode: null,
+    };
   }
 }

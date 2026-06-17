@@ -12,6 +12,8 @@ import PnLSummary from "./components/PnLSummary";
 import Charts from "./components/Charts";
 import OptionsAnalyzer from "./components/OptionsAnalyzer";
 import OptionsAnalyzerV2 from "./components/OptionsAnalyzerV2";
+import PutCalendar from "./components/PutCalendar";
+import CallCalendar from "./components/CallCalendar";
 import { runBacktest } from "./api/backtest";
 import type { BacktestRequest, BacktestResponse } from "./types";
 
@@ -123,6 +125,16 @@ const App: React.FC = () => {
                 label: "Option Analyser V2",
                 children: <OptionsAnalyzerV2 />,
               },
+              {
+                key: "put-calendar",
+                label: "Put Calendar",
+                children: <PutCalendar />,
+              },
+              {
+                key: "call-calendar",
+                label: "Call Calendar",
+                children: <CallCalendar />,
+              },
             ]}
           />
         </Content>
@@ -136,3 +148,7 @@ const App: React.FC = () => {
 };
 
 export default App;
+
+
+// An API to get stock price for a given symbol and date range of two years , for any give closing price and date- find the next  higheshet closing from the array and get date...
+

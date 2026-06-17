@@ -12,6 +12,7 @@ import {
   Alert,
   Spin,
   Card,
+  Modal,
   message,
   Empty,
   Popconfirm,
@@ -87,13 +88,24 @@ const DEFAULT_INPUT: OptionsInputV2 = {
   symbol: "SPY",
 };
 
-const OptionsAnalyzerV2: React.FC = () => {
+const PutCalendar: React.FC = () => {
   const [formInput, setFormInput] = useState<OptionsInputV2>(DEFAULT_INPUT);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [copied, setCopied] = useState(false);
   const [cancelRequested, setCancelRequested] = useState(false);
+  const [isInputPopupOpen, setIsInputPopupOpen] = useState(false);
+  const [selectedStrikeLabel, setSelectedStrikeLabel] = useState<string>("Put Strike");
+
+  const openInputPopup = (strikeLabel: string) => {
+    setSelectedStrikeLabel(strikeLabel);
+    setIsInputPopupOpen(true);
+  };
+
+  const closeInputPopup = () => {
+    setIsInputPopupOpen(false);
+  };
 
   const getCacheKey = (
     symbol: string,
@@ -356,24 +368,14 @@ const OptionsAnalyzerV2: React.FC = () => {
           cacheUpdated = true;
         }
 
-        const ceCanUseCache = Boolean(
-          ceCached &&
-          ((ceCached.skipFuture && ceCached.statusCode === 404) ||
-            ceCached.openPrice !== null ||
-            ceCached.closePrice !== null)
-        );
+        const ceCanUseCache = true;
         const peCanUseCache = Boolean(
           peCached &&
           ((peCached.skipFuture && peCached.statusCode === 404) ||
             peCached.openPrice !== null ||
             peCached.closePrice !== null)
         );
-        const longCeCanUseCache = Boolean(
-          longCeCached &&
-          ((longCeCached.skipFuture && longCeCached.statusCode === 404) ||
-            longCeCached.openPrice !== null ||
-            longCeCached.closePrice !== null)
-        );
+        const longCeCanUseCache = true;
         const longPeCanUseCache = Boolean(
           longPeCached &&
           ((longPeCached.skipFuture && longPeCached.statusCode === 404) ||
@@ -395,15 +397,13 @@ const OptionsAnalyzerV2: React.FC = () => {
               statusCode: stockCached?.statusCode ?? null,
             })
             : fetchStockWithRateLimitRetry(symbol, date),
-          ceCanUseCache
-            ? Promise.resolve({
-              openPrice: ceCached?.openPrice ?? null,
-              closePrice: ceCached?.closePrice ?? null,
-              delta: ceCached?.delta ?? null,
-              theta: ceCached?.theta ?? null,
-              statusCode: ceCached?.statusCode ?? null,
-            })
-            : fetchOptionWithRateLimitRetry(symbol, expiryDate, ceStrike, "C", date),
+          Promise.resolve({
+            openPrice: null,
+            closePrice: null,
+            delta: null,
+            theta: null,
+            statusCode: null,
+          }),
           peCanUseCache
             ? Promise.resolve({
               openPrice: peCached?.openPrice ?? null,
@@ -413,15 +413,13 @@ const OptionsAnalyzerV2: React.FC = () => {
               statusCode: peCached?.statusCode ?? null,
             })
             : fetchOptionWithRateLimitRetry(symbol, expiryDate, peStrike, "P", date),
-          longCeCanUseCache
-            ? Promise.resolve({
-              openPrice: longCeCached?.openPrice ?? null,
-              closePrice: longCeCached?.closePrice ?? null,
-              delta: longCeCached?.delta ?? null,
-              theta: longCeCached?.theta ?? null,
-              statusCode: longCeCached?.statusCode ?? null,
-            })
-            : fetchOptionWithRateLimitRetry(symbol, longExpiryDate, ceStrike, "C", date),
+          Promise.resolve({
+            openPrice: null,
+            closePrice: null,
+            delta: null,
+            theta: null,
+            statusCode: null,
+          }),
           longPeCanUseCache
             ? Promise.resolve({
               openPrice: longPeCached?.openPrice ?? null,
@@ -657,8 +655,7 @@ const OptionsAnalyzerV2: React.FC = () => {
 
   const clearLocalStorageCache = () => {
     localStorage.removeItem(MASTER_OPTION_DATA_KEY);
-    localStorage.removeItem(MASTER_STOCK_DATA_KEY);
-    message.success("Local cache cleared");
+    message.success("Option cache cleared");
   };
 
   const handleFieldChange = <K extends keyof OptionsInputV2>(field: K, value: OptionsInputV2[K]) => {
@@ -678,37 +675,21 @@ const OptionsAnalyzerV2: React.FC = () => {
       const exportRows = result.rows.map((row) => ({
         Date: row.date,
         "Closing/Stock Price": row.closingPrice !== null ? row.closingPrice.toFixed(2) : "—",
-        "CE Strike": row.ceStrike.toFixed(0),
         "PE Strike": row.peStrike.toFixed(0),
-        "CE Call Premium": row.cePremiumData
-          ? `${row.cePremiumData.expiryDate}-${row.cePremiumData.strike}`
-          : "—",
-        "Call Price": row.cePremiumData ? row.cePremiumData.closePrice.toFixed(2) : "—",
-        "Mark change - Call": row.markChangeCall !== null ? row.markChangeCall.toFixed(2) : "—",
         "Put Premium": row.pePremiumData
           ? `${row.pePremiumData.expiryDate}-${row.pePremiumData.strike}`
 
           : "—",
         "PE Price": row.pePremiumData ? row.pePremiumData.closePrice.toFixed(2) : "—",
-        "Total Value":
-          row.cePremiumData !== null && row.pePremiumData !== null
-            ? (row.cePremiumData.closePrice + row.pePremiumData.closePrice).toFixed(2)
-            : "—",
-        "Long Call Price": row.longCePremiumData ? row.longCePremiumData.closePrice.toFixed(2) : "—",
+        "Put Value": row.pePremiumData !== null ? row.pePremiumData.closePrice.toFixed(2) : "—",
         "Long Put Price": row.longPePremiumData ? row.longPePremiumData.closePrice.toFixed(2) : "—",
-        "Long Total Value":
-          row.longCePremiumData !== null && row.longPePremiumData !== null
-            ? (row.longCePremiumData.closePrice + row.longPePremiumData.closePrice).toFixed(2)
-            : "—",
+        "Long Put Value": row.longPePremiumData !== null ? row.longPePremiumData.closePrice.toFixed(2) : "—",
         "Net Value":
-          row.cePremiumData !== null &&
           row.pePremiumData !== null &&
-          row.longCePremiumData !== null &&
           row.longPePremiumData !== null
             ? (
-                row.longCePremiumData.closePrice +
                 row.longPePremiumData.closePrice -
-                (row.cePremiumData.closePrice + row.pePremiumData.closePrice)
+                row.pePremiumData.closePrice
               ).toFixed(2)
             : "—",
         "Mark change - Put": row.markChangePut !== null ? row.markChangePut.toFixed(2) : "—",
@@ -771,13 +752,21 @@ const OptionsAnalyzerV2: React.FC = () => {
     //   width: 120,
     //   render: (value: number) => value.toFixed(0),
     // },
-    // {
-    //   title: "Put Strike",
-    //   dataIndex: "peStrike",
-    //   key: "peStrike",
-    //   width: 120,
-    //   render: (value: number) => value.toFixed(0),
-    // },
+    {
+      title: "Put Strike",
+      dataIndex: "peStrike",
+      key: "peStrike",
+      width: 120,
+      render: (value: number) => (
+        <Button
+          type="link"
+          style={{ padding: 0, height: "auto" }}
+          onClick={() => openInputPopup("Put Strike")}
+        >
+          {value.toFixed(0)}
+        </Button>
+      ),
+    },
     // {
     //   title: "Call Premium",
     //   dataIndex: "cePremiumData",
@@ -788,38 +777,6 @@ const OptionsAnalyzerV2: React.FC = () => {
     //     return `${value.expiryDate}-${value.strike}`;
     //   },
     // },
-    {
-      title: "Call Price",
-      dataIndex: "cePremiumData",
-      key: "cePrice",
-      width: 200,
-      render: (value: StrikePremium | null, _record: OptionsAnalysisRowV2, index: number) => {
-        if (!value) return "—";
-
-        let percentageChange: number | null = null;
-        if (result && result.rows.length > 0 && index !== 0) {
-          const firstRow = result.rows[0];
-          const firstCallPrice = firstRow.cePremiumData?.closePrice ?? null;
-          if (firstCallPrice !== null && firstCallPrice !== 0) {
-            percentageChange = ((value.closePrice - firstCallPrice) / firstCallPrice) * 100;
-          }
-        }
-
-        const percentageDisplay =
-          percentageChange !== null
-            ? ` (${percentageChange > 0 ? "+" : ""}${percentageChange.toFixed(2)}%)`
-            : "";
-        const percentageColor =
-          percentageChange !== null ? (percentageChange >= 0 ? "#52c41a" : "#ff4d4f") : "inherit";
-
-        return (
-          <div style={{ color: percentageColor }}>
-            {value.closePrice.toFixed(2)}
-            {percentageDisplay}
-          </div>
-        );
-      },
-    },
     // {
     //   title: "Mark change - Call",
     //   dataIndex: "markChangeCall",
@@ -841,7 +798,7 @@ const OptionsAnalyzerV2: React.FC = () => {
     //   },
     // },
     {
-      title: "Put Price",
+      title: "Sold/Short Put Price",
       dataIndex: "pePremiumData",
       key: "pePrice",
       width: 200,
@@ -883,26 +840,7 @@ const OptionsAnalyzerV2: React.FC = () => {
     //   },
     // },
     {
-      title: "Total Value",
-      key: "totalValue",
-      width: 130,
-      render: (_value: unknown, record: OptionsAnalysisRowV2) => {
-        if (!record.cePremiumData || !record.pePremiumData) return "—";
-        return (record.cePremiumData.closePrice + record.pePremiumData.closePrice).toFixed(2);
-      },
-    },
-    {
-      title: "Long Call Price",
-      dataIndex: "longCePremiumData",
-      key: "longCePrice",
-      width: 140,
-      render: (value: StrikePremium | null) => {
-        if (!value) return "—";
-        return value.closePrice.toFixed(2);
-      },
-    },
-    {
-      title: "Long Put Price",
+      title: "Bought/Long Put Price",
       dataIndex: "longPePremiumData",
       key: "longPePrice",
       width: 140,
@@ -912,48 +850,73 @@ const OptionsAnalyzerV2: React.FC = () => {
       },
     },
     {
-      title: "Long Total Value",
-      key: "longTotalValue",
-      width: 150,
-      render: (_value: unknown, record: OptionsAnalysisRowV2) => {
-        if (!record.longCePremiumData || !record.longPePremiumData) return "—";
-        return (record.longCePremiumData.closePrice + record.longPePremiumData.closePrice).toFixed(2);
-      },
-    },
-    {
       title: "Net Value",
       key: "netValue",
       width: 180,
       render: (_value: unknown, record: OptionsAnalysisRowV2, index: number) => {
         if (
-          !record.cePremiumData ||
           !record.pePremiumData ||
-          !record.longCePremiumData ||
           !record.longPePremiumData
         ) {
           return "—";
         }
 
-        const totalValue = record.cePremiumData.closePrice + record.pePremiumData.closePrice;
-        const longTotalValue =
-          record.longCePremiumData.closePrice + record.longPePremiumData.closePrice;
-        const netValue = longTotalValue - totalValue;
+        const netValue = record.longPePremiumData.closePrice - record.pePremiumData.closePrice;
 
         // Calculate percentage change from start date (first row)
         let percentageChange: number | null = null;
         if (result && result.rows.length > 0 && index !== 0) {
           const firstRow = result.rows[0];
           if (
-            firstRow.cePremiumData &&
             firstRow.pePremiumData &&
-            firstRow.longCePremiumData &&
             firstRow.longPePremiumData
           ) {
-            const firstTotalValue =
-              firstRow.cePremiumData.closePrice + firstRow.pePremiumData.closePrice;
-            const firstLongTotalValue =
-              firstRow.longCePremiumData.closePrice + firstRow.longPePremiumData.closePrice;
-            const firstNetValue = firstLongTotalValue - firstTotalValue;
+            const firstNetValue =
+              firstRow.longPePremiumData.closePrice - firstRow.pePremiumData.closePrice;
+
+            if (firstNetValue !== 0) {
+              percentageChange = ((netValue - firstNetValue) / firstNetValue) * 100;
+            }
+          }
+        }
+
+        const percentageDisplay =
+          percentageChange !== null
+            ? ` (${percentageChange > 0 ? "+" : ""}${percentageChange.toFixed(2)}%)`
+            : "";
+        const percentageColor = percentageChange !== null ? (percentageChange >= 0 ? "#52c41a" : "#ff4d4f") : "inherit";
+
+        return (
+          <div style={{ color: percentageColor }}>
+            {netValue.toFixed(2)}
+            {percentageDisplay}
+          </div>
+        );
+      },
+    }, {
+      title: "Net Value- 12L-10S",
+      key: "netValue",
+      width: 180,
+      render: (_value: unknown, record: OptionsAnalysisRowV2, index: number) => {
+        if (
+          !record.pePremiumData ||
+          !record.longPePremiumData
+        ) {
+          return "—";
+        }
+
+        const netValue = 12*record.longPePremiumData.closePrice - 10*record.pePremiumData.closePrice;
+
+        // Calculate percentage change from start date (first row)
+        let percentageChange: number | null = null;
+        if (result && result.rows.length > 0 && index !== 0) {
+          const firstRow = result.rows[0];
+          if (
+            firstRow.pePremiumData &&
+            firstRow.longPePremiumData
+          ) {
+            const firstNetValue =
+              12*firstRow.longPePremiumData.closePrice - 10*firstRow.pePremiumData.closePrice;
 
             if (firstNetValue !== 0) {
               percentageChange = ((netValue - firstNetValue) / firstNetValue) * 100;
@@ -978,163 +941,190 @@ const OptionsAnalyzerV2: React.FC = () => {
   ];
 
   return (
-    <div style={{ padding: "24px" }}>
-      <Card title="Options Chain Analyzer" style={{ marginBottom: "24px" }}>
-        <Space direction="vertical" style={{ width: "100%" }} size="large">
-          <div>
-            <label style={{ display: "block", marginBottom: "8px", fontWeight: "500" }}>
-              Input Parameters:
-            </label>
-            <Space wrap style={{ width: "100%" }} size="middle" align="start">
-              <div>
-                <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
-                  Symbol
-                </label>
-                <Input
-                  value={formInput.symbol}
-                  onChange={(e) => handleFieldChange("symbol", e.target.value.toUpperCase())}
-                  placeholder="Symbol"
-                  style={{ width: 140 }}
-                  aria-label="Symbol"
-                />
-              </div>
-              <div>
-                <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
-                  Strike Price
-                </label>
-                <Input
-                  type="number"
-                  value={String(formInput.strikePrice)}
-                  onChange={(e) => handleFieldChange("strikePrice", Number(e.target.value))}
-                  placeholder="Strike Price"
-                  style={{ width: 140 }}
-                  aria-label="Strike Price"
-                />
-              </div>
-              <div>
-                <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
-                  Date
-                </label>
-                <Input
-                  type="date"
-                  value={formInput.date}
-                  onChange={(e) => handleFieldChange("date", e.target.value)}
-                  style={{ width: 170 }}
-                  aria-label="Date"
-                />
-              </div>
-              <div>
-                <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
-                  Expiry Date
-                </label>
-                <Input
-                  type="date"
-                  value={formInput.expiryDate}
-                  onChange={(e) => handleFieldChange("expiryDate", e.target.value)}
-                  style={{ width: 170 }}
-                  aria-label="Expiry Date"
-                />
-              </div>
-              <div>
-                <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
-                  Long Expiry Date
-                </label>
-                <Input
-                  type="date"
-                  value={formInput.longExpiryDate}
-                  onChange={(e) => handleFieldChange("longExpiryDate", e.target.value)}
-                  style={{ width: 170 }}
-                  aria-label="Long Expiry Date"
-                />
-              </div>
+    <div
+      style={{
+        width: "100%",
+        maxWidth: "none",
+        margin: "0 auto",
+        padding: "16px clamp(5px, 1.2vw, 10px)",
+        boxSizing: "border-box",
+        height: "calc(100vh - 140px)",
+        overflow: "hidden",
+        display: "flex",
+        flexDirection: "column",
+        gap: "8px",
+      }}
+    >
+      <div style={{ display: "flex", gap: "8px", flex: 1, minHeight: 0 }}>
+        <Card title="Put Calendar" style={{ width: 260, flex: "0 0 260px" }}>
+          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+            <div>
+              <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
+                Symbol
+              </label>
+              <Input
+                value={formInput.symbol}
+                onChange={(e) => handleFieldChange("symbol", e.target.value.toUpperCase())}
+                placeholder="Symbol"
+                style={{ width: "100%" }}
+                aria-label="Symbol"
+              />
+            </div>
+            <div>
+              <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
+                Strike Price
+              </label>
+              <Input
+                type="number"
+                value={String(formInput.strikePrice)}
+                onChange={(e) => handleFieldChange("strikePrice", Number(e.target.value))}
+                placeholder="Strike Price"
+                style={{ width: "100%" }}
+                aria-label="Strike Price"
+              />
+            </div>
+            <div>
+              <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
+                Date
+              </label>
+              <Input
+                type="date"
+                value={formInput.date}
+                onChange={(e) => handleFieldChange("date", e.target.value)}
+                style={{ width: "100%" }}
+                aria-label="Date"
+              />
+            </div>
+            <div>
+              <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
+                Expiry Date
+              </label>
+              <Input
+                type="date"
+                value={formInput.expiryDate}
+                onChange={(e) => handleFieldChange("expiryDate", e.target.value)}
+                style={{ width: "100%" }}
+                aria-label="Expiry Date"
+              />
+            </div>
+            <div>
+              <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
+                Long Expiry Date
+              </label>
+              <Input
+                type="date"
+                value={formInput.longExpiryDate}
+                onChange={(e) => handleFieldChange("longExpiryDate", e.target.value)}
+                style={{ width: "100%" }}
+                aria-label="Long Expiry Date"
+              />
+            </div>
+
+            <Space wrap>
+              <Button
+                type="primary"
+                icon={<PlayCircleOutlined />}
+                onClick={handleAnalyze}
+                loading={loading}
+                size="large"
+                disabled={cancelRequested}
+              >
+                Analyze
+              </Button>
+              <Button
+                danger
+                onClick={handleCancel}
+                disabled={!loading}
+                size="large"
+              >
+                Cancel
+              </Button>
+              <Button onClick={handleReset} size="large">
+                Reset
+              </Button>
             </Space>
-            <p style={{ fontSize: "12px", color: "#666", marginTop: "8px" }}>
-              Fields: expiry date, long expiry date, date, strike price, and symbol.
-              Dates should be in YYYY-MM-DD format.
-            </p>
-          </div>
 
-          <Space>
-            <Button
-              type="primary"
-              icon={<PlayCircleOutlined />}
-              onClick={handleAnalyze}
-              loading={loading}
-              size="large"
-              disabled={cancelRequested}
-            >
-              Analyze
-            </Button>
-            <Button
-              danger
-              onClick={handleCancel}
-              disabled={!loading}
-              size="large"
-            >
-              Cancel
-            </Button>
-            <Button
-              onClick={handleReset}
-              size="large"
-            >
-              Reset
-            </Button>
+            {error && <Alert message="Error" description={error} type="error" showIcon />}
+
+            {result && (
+              <div>
+                <p style={{ fontWeight: "500", marginBottom: "8px" }}>Input Data:</p>
+                <pre
+                  style={{
+                    backgroundColor: "#f5f5f5",
+                    padding: "12px",
+                    borderRadius: "4px",
+                    overflow: "auto",
+                    maxHeight: "180px",
+                    margin: 0,
+                  }}
+                >
+                  {JSON.stringify(result.inputData, null, 2)}
+                </pre>
+              </div>
+            )}
           </Space>
-
-          {error && <Alert message="Error" description={error} type="error" showIcon />}
-        </Space>
-      </Card>
-
-      {loading && (
-        <Card style={{ textAlign: "center" }}>
-          <Spin size="large" tip="Fetching option prices..." />
         </Card>
-      )}
 
-      {result && (
-        <Card title="Analysis Results" style={{ marginBottom: "24px" }}>
-          <Space style={{ marginBottom: "16px" }}>
-            <Button
-              icon={copied ? <CheckOutlined /> : <CopyOutlined />}
-              onClick={copyToClipboard}
-            >
-              {copied ? "Copied!" : "Copy Results"}
-            </Button>
-            <Button icon={<DownloadOutlined />} onClick={downloadCurrentViewAsExcel}>
-              Download Excel
-            </Button>
-          </Space>
-
-          {result.rows.length === 0 ? (
-            <Empty description="No data to display" />
-          ) : (
-            <Table
-              columns={columns}
-              dataSource={result.rows.map((row, idx) => ({
-                ...row,
-                key: idx,
-              }))}
-              pagination={{ pageSize: 50 }}
-              scroll={{ x: 2200 }}
-              size="small"
-            />
+        <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", gap: "8px" }}>
+          {loading && (
+            <Card style={{ textAlign: "center", flex: "0 0 auto" }}>
+              <Spin size="large" tip="Fetching option prices..." />
+            </Card>
           )}
 
-          <div style={{ marginTop: "24px" }}>
-            <p style={{ fontWeight: "500", marginBottom: "8px" }}>Input Data:</p>
-            <pre
+          {result ? (
+            <Card
+              title="Analysis Results"
               style={{
-                backgroundColor: "#f5f5f5",
-                padding: "12px",
-                borderRadius: "4px",
-                overflow: "auto",
+                width: "100%",
+                flex: "1 1 auto",
+                minHeight: 0,
+                display: "flex",
+                flexDirection: "column",
+              }}
+              bodyStyle={{
+                display: "flex",
+                flexDirection: "column",
+                minHeight: 0,
               }}
             >
-              {JSON.stringify(result.inputData, null, 2)}
-            </pre>
-          </div>
-        </Card>
-      )}
+              <Space style={{ marginBottom: "16px" }}>
+                <Button
+                  icon={copied ? <CheckOutlined /> : <CopyOutlined />}
+                  onClick={copyToClipboard}
+                >
+                  {copied ? "Copied!" : "Copy Results"}
+                </Button>
+                <Button icon={<DownloadOutlined />} onClick={downloadCurrentViewAsExcel}>
+                  Download Excel
+                </Button>
+              </Space>
+
+              {result.rows.length === 0 ? (
+                <Empty description="No data to display" />
+              ) : (
+                <div style={{ width: "100%", flex: 1, minHeight: 400, overflow: "hidden" }}>
+                  <Table
+                    columns={columns}
+                    dataSource={result.rows.map((row, idx) => ({
+                      ...row,
+                      key: idx,
+                    }))}
+                    pagination={{ pageSize: 50 }}
+                    scroll={{ x: "max-content", y: "calc(100vh - 320px)" }}
+                    size="small"
+                  />
+                </div>
+              )}
+            </Card>
+          ) : (
+            <Card style={{ flex: 1, minHeight: 0 }}>
+              <Empty description="Run analysis to view grid" />
+            </Card>
+          )}
+        </div>
+      </div>
 
       <div
         style={{
@@ -1145,8 +1135,8 @@ const OptionsAnalyzerV2: React.FC = () => {
         }}
       >
         <Popconfirm
-          title="Clear local cache?"
-          description="This will remove saved option data from local storage."
+          title="Clear option cache?"
+          description="This will remove only saved option data from local storage. Stock cache will be kept."
           okText="Clear"
           cancelText="Cancel"
           onConfirm={clearLocalStorageCache}
@@ -1156,10 +1146,41 @@ const OptionsAnalyzerV2: React.FC = () => {
           </Button>
         </Popconfirm>
       </div>
+
+      <Modal
+        title={`${selectedStrikeLabel} - Input Details`}
+        open={isInputPopupOpen}
+        onCancel={closeInputPopup}
+        footer={null}
+        destroyOnClose
+      >
+        <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <div>
+            <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Symbol</label>
+            <Input value={formInput.symbol} readOnly />
+          </div>
+          <div>
+            <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Strike Price</label>
+            <Input value={String(formInput.strikePrice)} readOnly />
+          </div>
+          <div>
+            <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Date</label>
+            <Input value={formInput.date} readOnly />
+          </div>
+          <div>
+            <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Expiry Date</label>
+            <Input value={formInput.expiryDate} readOnly />
+          </div>
+          <div>
+            <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Long Expiry Date</label>
+            <Input value={formInput.longExpiryDate} readOnly />
+          </div>
+        </Space>
+      </Modal>
     </div>
   );
 };
 
-export default OptionsAnalyzerV2;
+export default PutCalendar;
 
 

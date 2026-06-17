@@ -71,6 +71,8 @@ export interface StrikePremium {
   expiryDate: string;
   strike: number;
   closePrice: number;
+  delta?: number | null;
+  theta?: number | null;
 }
 
 /** Result row for options analyzer table */
