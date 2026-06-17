@@ -80,5 +80,7 @@ export interface OptionsAnalysisRow {
   ceStrike: number;
   peStrike: number;
   cePremiumData: StrikePremium | null; // Expiry date, strike, close price
+  markChangeCall: number | null; // CE close - CE open
   pePremiumData: StrikePremium | null;
+  markChangePut: number | null; // PE close - PE open
 }

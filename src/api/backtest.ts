@@ -5,6 +5,12 @@
 
 import type { BacktestRequest, BacktestResponse, PricePoint } from "../types";
 
+export interface OptionOpenClose {
+  openPrice: number | null;
+  closePrice: number | null;
+  statusCode: number | null;
+}
+
 // Base URL defaults to the FastAPI dev server; override via env var if needed
 const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
@@ -64,6 +70,20 @@ export async function fetchOptionPrice(
   optionType: "C" | "P",
   date: string
 ): Promise<number | null> {
+  const result = await fetchOptionOpenClose(symbol, expiryDate, strikePrice, optionType, date);
+  return result.closePrice;
+}
+
+/**
+ * Fetch open and close price data for a specific option from Massive.com API
+ */
+export async function fetchOptionOpenClose(
+  symbol: string,
+  expiryDate: string,
+  strikePrice: number,
+  optionType: "C" | "P",
+  date: string
+): Promise<OptionOpenClose> {
   try {
     // Format the option symbol: O:SPY260618C00750000 (only 750 gets replaced with CE/PE strike)
     const optionSymbol = `O:${symbol}${expiryDate}${optionType}00${strikePrice}000`;
@@ -75,15 +95,48 @@ export async function fetchOptionPrice(
     
     if (!res.ok) {
       console.warn(`Failed to fetch option price for ${optionSymbol} on ${date}: ${res.status}`);
-      return null;
+      return { openPrice: null, closePrice: null, statusCode: res.status };
     }
     
     const data = await res.json();
     
-    // Return the close price if available
-    return data.close ?? data.c ?? null;
+    return {
+      openPrice: data.open ?? data.o ?? null,
+      closePrice: data.close ?? data.c ?? null,
+      statusCode: res.status,
+    };
   } catch (error) {
     console.error(`Error fetching option price:`, error);
-    return null;
+    return { openPrice: null, closePrice: null, statusCode: null };
+  }
+}
+
+/**
+ * Fetch open and close price data for a stock symbol from Massive.com API.
+ */
+export async function fetchStockOpenClose(
+  symbol: string,
+  date: string
+): Promise<OptionOpenClose> {
+  try {
+    const url = `${MASSIVE_BASE_URL}/${symbol}/${date}?adjusted=true&apiKey=${MASSIVE_API_KEY}`;
+
+    const res = await fetch(url);
+
+    if (!res.ok) {
+      console.warn(`Failed to fetch stock price for ${symbol} on ${date}: ${res.status}`);
+      return { openPrice: null, closePrice: null, statusCode: res.status };
+    }
+
+    const data = await res.json();
+
+    return {
+      openPrice: data.open ?? data.o ?? null,
+      closePrice: data.close ?? data.c ?? null,
+      statusCode: res.status,
+    };
+  } catch (error) {
+    console.error(`Error fetching stock price:`, error);
+    return { openPrice: null, closePrice: null, statusCode: null };
   }
 }

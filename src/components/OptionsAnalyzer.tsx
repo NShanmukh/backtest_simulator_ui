@@ -12,14 +12,19 @@ import {
   Alert,
   Spin,
   Card,
-  Col,
-  Row,
   message,
   Empty,
 } from "antd";
-import { PlayCircleOutlined, CopyOutlined, CheckOutlined } from "@ant-design/icons";
+import {
+  PlayCircleOutlined,
+  CopyOutlined,
+  CheckOutlined,
+  DownloadOutlined,
+} from "@ant-design/icons";
 import dayjs from "dayjs";
-import { fetchOptionPrice } from "../api/backtest";
+import * as XLSX from "xlsx";
+import { fetchOptionOpenClose } from "../api/backtest";
+import tradingDates2026Json from "../assets/trading_dates_2026.json";
 import type {
   OptionsInput,
   OptionsAnalysisRow,
@@ -31,16 +36,35 @@ interface AnalysisResult {
   inputData: OptionsInput[];
 }
 
+interface CachedOptionResponse {
+  symbol: string;
+  expiryDate: string;
+  strikePrice: number;
+  optionType: "C" | "P";
+  date: string;
+  openPrice: number | null;
+  closePrice: number | null;
+  statusCode: number | null;
+  skipFuture: boolean;
+}
+
+type MasterOptionData = Record<string, CachedOptionResponse>;
+
+const MASTER_OPTION_DATA_KEY = "masterOptionData";
+const tradingDates2026 = new Set<string>(tradingDates2026Json as string[]);
+const RATE_LIMIT_WAIT_MS = 65_000;
+const MAX_RATE_LIMIT_RETRIES = 3;
+
 const OptionsAnalyzer: React.FC = () => {
   const [jsonInput, setJsonInput] = useState<string>(
     JSON.stringify(
       [
         {
-          expiryDate: "2026-06-18",
-          date: "2026-05-15",
-          strikePrice: 750,
-          symbol: "SPY",
-        },
+          "expiryDate": "2026-12-18",
+          "date": "2026-05-01",
+          "strikePrice": 450,
+          "symbol": "GLD"
+        }
       ],
       null,
       2
@@ -51,20 +75,54 @@ const OptionsAnalyzer: React.FC = () => {
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [copied, setCopied] = useState(false);
 
-  /**
-   * Generate array of dates between two dates (inclusive)
-   */
-  const generateDateRange = (startDate: string, endDate: string): string[] => {
-    const dates: string[] = [];
-    let current = dayjs(startDate);
-    const end = dayjs(endDate);
+  const getCacheKey = (
+    symbol: string,
+    expiryDate: string,
+    strikePrice: number,
+    optionType: "C" | "P",
+    date: string
+  ): string => {
+    return `${symbol}|${expiryDate}|${strikePrice}|${optionType}|${date}`;
+  };
 
-    while (current.valueOf() <= end.valueOf()) {
-      dates.push(current.format("YYYY-MM-DD"));
-      current = current.add(1, "day");
+  const loadMasterOptionData = (): MasterOptionData => {
+    try {
+      const raw = localStorage.getItem(MASTER_OPTION_DATA_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+      return parsed as MasterOptionData;
+    } catch {
+      return {};
+    }
+  };
+
+  const saveMasterOptionData = (data: MasterOptionData) => {
+    localStorage.setItem(MASTER_OPTION_DATA_KEY, JSON.stringify(data));
+  };
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const fetchOptionWithRateLimitRetry = async (
+    symbol: string,
+    expiryDate: string,
+    strikePrice: number,
+    optionType: "C" | "P",
+    date: string
+  ) => {
+    let response = await fetchOptionOpenClose(symbol, expiryDate, strikePrice, optionType, date);
+    let attempts = 0;
+
+    while (response.statusCode === 429 && attempts < MAX_RATE_LIMIT_RETRIES) {
+      attempts += 1;
+      message.warning(`Rate limit hit (429). Waiting 65 seconds before retry ${attempts}.`);
+      await sleep(RATE_LIMIT_WAIT_MS);
+      response = await fetchOptionOpenClose(symbol, expiryDate, strikePrice, optionType, date);
     }
 
-    return dates;
+    return response;
   };
 
   /**
@@ -103,6 +161,9 @@ const OptionsAnalyzer: React.FC = () => {
             `Invalid object at index ${idx}: must have expiryDate, date, strikePrice, and symbol`
           );
         }
+        if (!Number.isFinite(obj.strikePrice)) {
+          throw new Error(`Invalid strikePrice at index ${idx}: must be a finite number`);
+        }
         // Validate dates are valid ISO format
         if (!dayjs(obj.expiryDate).isValid() || !dayjs(obj.date).isValid()) {
           throw new Error(
@@ -118,6 +179,38 @@ const OptionsAnalyzer: React.FC = () => {
     }
   };
 
+  const expandInputData = (inputs: OptionsInput[]): OptionsInput[] => {
+    const expanded: OptionsInput[] = [];
+
+    for (const input of inputs) {
+      const start = dayjs(input.date);
+      const end = dayjs(input.expiryDate);
+
+      if (start.isAfter(end)) {
+        throw new Error(
+          `Invalid range for ${input.symbol}: date (${input.date}) cannot be after expiryDate (${input.expiryDate})`
+        );
+      }
+
+      let current = start;
+      while (!current.isAfter(end, "day")) {
+        // skip dates that are not in the trading_dates_2026 set to reduce API calls for non-trading days
+        if (!tradingDates2026.has(current.format("YYYY-MM-DD"))) {
+          current = current.add(1, "day");
+          continue;
+        }
+
+        expanded.push({
+          ...input,
+          date: current.format("YYYY-MM-DD"),
+        });
+        current = current.add(1, "day");
+      }
+    }
+
+    return expanded;
+  };
+
   /**
    * Main analysis function
    */
@@ -128,56 +221,178 @@ const OptionsAnalyzer: React.FC = () => {
 
     try {
       const inputData = parseInput();
-
-      // Get the date range from first to last object
-      const startDate = inputData[0].date;
-      const endDate = inputData[inputData.length - 1].date;
-      const dateRange = generateDateRange(startDate, endDate);
-
-      // Use the first object's data (symbol, strike price, expiry)
-      const firstInput = inputData[0];
-      const strikePrice = firstInput.strikePrice;
-      const symbol = firstInput.symbol.toUpperCase();
-      const expiryDate = formatExpiryDate(firstInput.expiryDate);
+      const expandedInputData = expandInputData(inputData);
+      const masterOptionData = loadMasterOptionData();
+      let cacheUpdated = false;
+      let sawRateLimit = false;
 
       const rows: OptionsAnalysisRow[] = [];
+      setResult({ rows: [], inputData });
 
-      // For each date in range, fetch CE and PE premiums
-      for (const date of dateRange) {
-        const ceStrike = strikePrice + 5;
-        const peStrike = strikePrice - 5;
+      // Process each input row independently so each row keeps its own strike/symbol/expiry/date
+      for (const input of expandedInputData) {
+        const date = input.date;
+        const strikePrice = input.strikePrice;
+        const symbol = input.symbol.toUpperCase();
+        const expiryDate = formatExpiryDate(input.expiryDate);
+        const ceStrike = strikePrice + 0;//temp 0
+        const peStrike = strikePrice - 0;// temp 0 
 
-        // Fetch prices in parallel
-        const [cePrice, pePrice] = await Promise.all([
-          fetchOptionPrice(symbol, expiryDate, ceStrike, "C", date),
-          fetchOptionPrice(symbol, expiryDate, peStrike, "P", date),
+        const ceKey = getCacheKey(symbol, expiryDate, ceStrike, "C", date);
+        const peKey = getCacheKey(symbol, expiryDate, peStrike, "P", date);
+
+        const ceCached = masterOptionData[ceKey];
+        const peCached = masterOptionData[peKey];
+
+        // Backfill old cache entries that predate status metadata.
+        if (ceCached && (typeof ceCached.skipFuture === "undefined" || typeof ceCached.statusCode === "undefined")) {
+          ceCached.skipFuture = false;
+          ceCached.statusCode = null;
+          cacheUpdated = true;
+        }
+        if (peCached && (typeof peCached.skipFuture === "undefined" || typeof peCached.statusCode === "undefined")) {
+          peCached.skipFuture = false;
+          peCached.statusCode = null;
+          cacheUpdated = true;
+        }
+
+        // Migrate old entries that used 429 as permanent skip so retries can happen.
+        if (ceCached?.statusCode === 429 && ceCached.skipFuture) {
+          ceCached.skipFuture = false;
+          cacheUpdated = true;
+        }
+        if (peCached?.statusCode === 429 && peCached.skipFuture) {
+          peCached.skipFuture = false;
+          cacheUpdated = true;
+        }
+
+        const ceCanUseCache = Boolean(
+          ceCached &&
+          ((ceCached.skipFuture && ceCached.statusCode === 404) ||
+            ceCached.openPrice !== null ||
+            ceCached.closePrice !== null)
+        );
+        const peCanUseCache = Boolean(
+          peCached &&
+          ((peCached.skipFuture && peCached.statusCode === 404) ||
+            peCached.openPrice !== null ||
+            peCached.closePrice !== null)
+        );
+
+        // Check localStorage cache first and call API only for misses
+        const [ceData, peData] = await Promise.all([
+          ceCanUseCache
+            ? Promise.resolve({
+              openPrice: ceCached?.openPrice ?? null,
+              closePrice: ceCached?.closePrice ?? null,
+              statusCode: ceCached?.statusCode ?? null,
+            })
+            : fetchOptionWithRateLimitRetry(symbol, expiryDate, ceStrike, "C", date),
+          peCanUseCache
+            ? Promise.resolve({
+              openPrice: peCached?.openPrice ?? null,
+              closePrice: peCached?.closePrice ?? null,
+              statusCode: peCached?.statusCode ?? null,
+            })
+            : fetchOptionWithRateLimitRetry(symbol, expiryDate, peStrike, "P", date),
         ]);
+
+        if (ceData.statusCode === 429 || peData.statusCode === 429) {
+          sawRateLimit = true;
+        }
+
+        const cePrice = ceData.closePrice;
+        const pePrice = peData.closePrice;
+
+        if (!ceCanUseCache) {
+          const shouldSkipCe = ceData.statusCode === 404;
+          masterOptionData[ceKey] = {
+            symbol,
+            expiryDate,
+            strikePrice: ceStrike,
+            optionType: "C",
+            date,
+            openPrice: ceData.openPrice,
+            closePrice: cePrice,
+            statusCode: ceData.statusCode,
+            skipFuture: shouldSkipCe,
+          };
+          cacheUpdated = true;
+        }
+
+        if (!peCanUseCache) {
+          const shouldSkipPe = peData.statusCode === 404;
+          masterOptionData[peKey] = {
+            symbol,
+            expiryDate,
+            strikePrice: peStrike,
+            optionType: "P",
+            date,
+            openPrice: peData.openPrice,
+            closePrice: pePrice,
+            statusCode: peData.statusCode,
+            skipFuture: shouldSkipPe,
+          };
+          cacheUpdated = true;
+        }
+
+        let previousDate: string | null = null;
+        for (let daysBack = 1; daysBack <= 5; daysBack += 1) {
+          const candidate = dayjs(date).subtract(daysBack, "day").format("YYYY-MM-DD");
+          if (tradingDates2026.has(candidate)) {
+            previousDate = candidate;
+            break;
+          }
+        }
+        const previousCeClose = previousDate
+          ? masterOptionData[getCacheKey(symbol, expiryDate, ceStrike, "C", previousDate)]
+            ?.closePrice ?? null
+          : null;
+        const previousPeClose = previousDate
+          ? masterOptionData[getCacheKey(symbol, expiryDate, peStrike, "P", previousDate)]
+            ?.closePrice ?? null
+          : null;
+
+        const markChangeCall =
+          cePrice !== null && previousCeClose !== null ? cePrice - previousCeClose : null;
+        const markChangePut =
+          pePrice !== null && previousPeClose !== null ? pePrice - previousPeClose : null;
 
         const row: OptionsAnalysisRow = {
           date: formatDisplayDate(date),
           closingPrice: strikePrice,
           ceStrike,
           peStrike,
-          cePremiumData: cePrice
+          cePremiumData: cePrice !== null
             ? {
-                expiryDate: formatDisplayDate(firstInput.expiryDate),
-                strike: ceStrike,
-                closePrice: cePrice,
-              }
+              expiryDate: formatDisplayDate(input.expiryDate),
+              strike: ceStrike,
+              closePrice: cePrice,
+            }
             : null,
-          pePremiumData: pePrice
+          markChangeCall,
+          pePremiumData: pePrice !== null
             ? {
-                expiryDate: formatDisplayDate(firstInput.expiryDate),
-                strike: peStrike,
-                closePrice: pePrice,
-              }
+              expiryDate: formatDisplayDate(input.expiryDate),
+              strike: peStrike,
+              closePrice: pePrice,
+            }
             : null,
+          markChangePut,
         };
 
         rows.push(row);
+        // Stream rows to the table as each API response completes.
+        setResult({ rows: [...rows], inputData });
       }
 
-      setResult({ rows, inputData });
+      if (cacheUpdated) {
+        saveMasterOptionData(masterOptionData);
+      }
+
+      if (sawRateLimit) {
+        message.warning("Some requests returned 429 after retries; processing continued.");
+      }
       message.success(`Analysis completed for ${rows.length} dates`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
@@ -203,6 +418,46 @@ const OptionsAnalyzer: React.FC = () => {
     }
   };
 
+  const downloadCurrentViewAsExcel = () => {
+    if (!result || result.rows.length === 0) {
+      message.warning("No rows available to export");
+      return;
+    }
+
+    try {
+      const exportRows = result.rows.map((row) => ({
+        Date: row.date,
+        "Closing/Stock Price": row.closingPrice.toFixed(2),
+        "CE Strike": row.ceStrike.toFixed(0),
+        "PE Strike": row.peStrike.toFixed(0),
+        "CE Call Premium": row.cePremiumData
+          ? `${row.cePremiumData.expiryDate}-${row.cePremiumData.strike}`
+          : "—",
+        "Call Price": row.cePremiumData ? row.cePremiumData.closePrice.toFixed(2) : "—",
+        "Mark change - Call": row.markChangeCall !== null ? row.markChangeCall.toFixed(2) : "—",
+        "Put Premium": row.pePremiumData
+          ? `${row.pePremiumData.expiryDate}-${row.pePremiumData.strike}`
+
+          : "—",
+        "PE Price": row.pePremiumData ? row.pePremiumData.closePrice.toFixed(2) : "—",
+        "Total Value":
+          row.cePremiumData !== null && row.pePremiumData !== null
+            ? (row.cePremiumData.closePrice + row.pePremiumData.closePrice).toFixed(2)
+            : "—",
+        "Mark change - Put": row.markChangePut !== null ? row.markChangePut.toFixed(2) : "—",
+      }));
+
+      const worksheet = XLSX.utils.json_to_sheet(exportRows);
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, "Analysis Results");
+
+      const timestamp = dayjs().format("YYYYMMDD-HHmmss");
+      XLSX.writeFile(workbook, `options-analysis-${timestamp}.xlsx`);
+    } catch {
+      message.error("Failed to export Excel file");
+    }
+  };
+
   const columns = [
     {
       title: "Date",
@@ -218,37 +473,86 @@ const OptionsAnalyzer: React.FC = () => {
       render: (value: number) => value.toFixed(2),
     },
     {
-      title: "CE Strike",
+      title: "Call Strike",
       dataIndex: "ceStrike",
       key: "ceStrike",
       width: 120,
       render: (value: number) => value.toFixed(0),
     },
     {
-      title: "PE Strike",
+      title: "Put Strike",
       dataIndex: "peStrike",
       key: "peStrike",
       width: 120,
       render: (value: number) => value.toFixed(0),
     },
     {
-      title: "CE Call Premium",
+      title: "Call Premium",
       dataIndex: "cePremiumData",
       key: "cePremium",
       width: 200,
       render: (value: StrikePremium | null) => {
         if (!value) return "—";
-        return `${value.expiryDate}-${value.strike}-${value.closePrice.toFixed(2)}`;
+        return `${value.expiryDate}-${value.strike}`;
       },
     },
     {
-      title: "PE Call Premium",
+      title: "Call Price",
+      dataIndex: "cePremiumData",
+      key: "cePrice",
+      width: 120,
+      render: (value: StrikePremium | null) => {
+        if (!value) return "—";
+        return value.closePrice.toFixed(2);
+      },
+    },
+    {
+      title: "Mark change - Call",
+      dataIndex: "markChangeCall",
+      key: "markChangeCall",
+      width: 170,
+      render: (value: number | null) => {
+        if (value === null) return "—";
+        return value.toFixed(2);
+      },
+    },
+    {
+      title: "Put Premium",
       dataIndex: "pePremiumData",
       key: "pePremium",
       width: 200,
       render: (value: StrikePremium | null) => {
         if (!value) return "—";
-        return `${value.expiryDate}-${value.strike}-${value.closePrice.toFixed(2)}`;
+        return `${value.expiryDate}-${value.strike}`;
+      },
+    },
+    {
+      title: "Put Price",
+      dataIndex: "pePremiumData",
+      key: "pePrice",
+      width: 120,
+      render: (value: StrikePremium | null) => {
+        if (!value) return "—";
+        return value.closePrice.toFixed(2);
+      },
+    },
+    {
+      title: "Mark change - Put",
+      dataIndex: "markChangePut",
+      key: "markChangePut",
+      width: 170,
+      render: (value: number | null) => {
+        if (value === null) return "—";
+        return value.toFixed(2);
+      },
+    },
+    {
+      title: "Total Value",
+      key: "totalValue",
+      width: 130,
+      render: (_value: unknown, record: OptionsAnalysisRow) => {
+        if (!record.cePremiumData || !record.pePremiumData) return "—";
+        return (record.cePremiumData.closePrice + record.pePremiumData.closePrice).toFixed(2);
       },
     },
   ];
@@ -265,7 +569,7 @@ const OptionsAnalyzer: React.FC = () => {
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               rows={10}
-              placeholder='[{"expiryDate": "2026-06-18", "date": "2026-05-15", "strikePrice": 750, "symbol": "SPY"}]'
+              placeholder='[{"expiryDate": "2026-06-12", "date": "2026-05-15", "strikePrice": 750, "symbol": "SPY"}]'
               style={{ fontFamily: "monospace" }}
             />
             <p style={{ fontSize: "12px", color: "#666", marginTop: "8px" }}>
@@ -305,6 +609,9 @@ const OptionsAnalyzer: React.FC = () => {
             >
               {copied ? "Copied!" : "Copy Results"}
             </Button>
+            <Button icon={<DownloadOutlined />} onClick={downloadCurrentViewAsExcel}>
+              Download Excel
+            </Button>
           </Space>
 
           {result.rows.length === 0 ? (
@@ -317,7 +624,7 @@ const OptionsAnalyzer: React.FC = () => {
                 key: idx,
               }))}
               pagination={{ pageSize: 50 }}
-              scroll={{ x: 1200 }}
+              scroll={{ x: 1600 }}
               size="small"
             />
           )}

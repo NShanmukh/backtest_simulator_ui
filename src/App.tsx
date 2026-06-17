@@ -11,6 +11,7 @@ import ResultsTable from "./components/ResultsTable";
 import PnLSummary from "./components/PnLSummary";
 import Charts from "./components/Charts";
 import OptionsAnalyzer from "./components/OptionsAnalyzer";
+import OptionsAnalyzerV2 from "./components/OptionsAnalyzerV2";
 import { runBacktest } from "./api/backtest";
 import type { BacktestRequest, BacktestResponse } from "./types";
 
@@ -116,6 +117,11 @@ const App: React.FC = () => {
                 key: "options-analyzer",
                 label: "Options Analyzer",
                 children: <OptionsAnalyzer />,
+              },
+              {
+                key: "options-analyser-v2",
+                label: "Option Analyser V2",
+                children: <OptionsAnalyzerV2 />,
               },
             ]}
           />
