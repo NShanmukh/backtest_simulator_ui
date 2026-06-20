@@ -28,6 +28,7 @@ import dayjs from "dayjs";
 import * as XLSX from "xlsx";
 import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
 import tradingDates2026Json from "../assets/trading_dates_2026.json";
+import NetValueChart from "./NetValueChart";
 import type {
   OptionsInput,
   OptionsAnalysisRow,
@@ -40,6 +41,7 @@ interface OptionsInputV2 extends OptionsInput {
 
 interface OptionsAnalysisRowV2 extends Omit<OptionsAnalysisRow, "closingPrice"> {
   closingPrice: number | null;
+  apiDate: string;
   longCePremiumData: StrikePremium | null;
   longPePremiumData: StrikePremium | null;
 }
@@ -59,6 +61,8 @@ interface CachedOptionResponse {
   closePrice: number | null;
   delta: number | null;
   theta: number | null;
+  soldPrice: number | null;
+  costPrice: number | null;
   statusCode: number | null;
   skipFuture: boolean;
 }
@@ -80,6 +84,7 @@ const MASTER_STOCK_DATA_KEY = "masterStockData";
 const tradingDates2026 = new Set<string>(tradingDates2026Json as string[]);
 const RATE_LIMIT_WAIT_MS = 2_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
+const NET_VALUE_MULTIPLIER = 10;
 const DEFAULT_INPUT: OptionsInputV2 = {
   expiryDate: "2026-06-30",
   longExpiryDate: "2026-12-31",
@@ -93,18 +98,74 @@ const CallCalendar: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [showChart, setShowChart] = useState(true);
   const [copied, setCopied] = useState(false);
   const [cancelRequested, setCancelRequested] = useState(false);
   const [isInputPopupOpen, setIsInputPopupOpen] = useState(false);
   const [selectedStrikeLabel, setSelectedStrikeLabel] = useState<string>("Call Strike");
+  const [selectedOptionContext, setSelectedOptionContext] = useState<{
+    symbol: string;
+    date: string;
+    expiryDate: string;
+    strikePrice: number;
+    optionType: "C";
+  } | null>(null);
+  const [optionDetailsLoading, setOptionDetailsLoading] = useState(false);
+  const [optionDetails, setOptionDetails] = useState<{
+    openPrice: number | null;
+    closePrice: number | null;
+    delta: number | null;
+    theta: number | null;
+    statusCode: number | null;
+  } | null>(null);
 
-  const openInputPopup = (strikeLabel: string) => {
+  const openInputPopup = (strikeLabel: string, record: OptionsAnalysisRowV2) => {
     setSelectedStrikeLabel(strikeLabel);
+    setSelectedOptionContext({
+      symbol: formInput.symbol.trim().toUpperCase(),
+      date: record.apiDate,
+      expiryDate: formInput.expiryDate,
+      strikePrice: record.ceStrike,
+      optionType: "C",
+    });
+    setOptionDetails(null);
     setIsInputPopupOpen(true);
   };
 
   const closeInputPopup = () => {
     setIsInputPopupOpen(false);
+  };
+
+  const updatePopupStrikePrice = (value: string) => {
+    const nextStrikePrice = value === "" ? 0 : Number(value);
+    setSelectedOptionContext((previous) =>
+      previous
+        ? {
+            ...previous,
+            strikePrice: nextStrikePrice,
+          }
+        : previous
+    );
+  };
+
+  const handleFetchOptionDetails = async () => {
+    if (!selectedOptionContext) return;
+
+    setOptionDetailsLoading(true);
+    try {
+      const response = await fetchOptionWithRateLimitRetry(
+        selectedOptionContext.symbol,
+        formatExpiryDate(selectedOptionContext.expiryDate),
+        selectedOptionContext.strikePrice,
+        selectedOptionContext.optionType,
+        selectedOptionContext.date
+      );
+      setOptionDetails(response);
+    } catch {
+      message.error("Failed to fetch option details");
+    } finally {
+      setOptionDetailsLoading(false);
+    }
   };
 
   const getCacheKey = (
@@ -403,6 +464,8 @@ const CallCalendar: React.FC = () => {
               closePrice: ceCached?.closePrice ?? null,
               delta: ceCached?.delta ?? null,
               theta: ceCached?.theta ?? null,
+              soldPrice: ceCached?.soldPrice ?? null,
+              costPrice: ceCached?.costPrice ?? null,
               statusCode: ceCached?.statusCode ?? null,
             })
             : fetchOptionWithRateLimitRetry(symbol, expiryDate, ceStrike, "C", date),
@@ -419,6 +482,8 @@ const CallCalendar: React.FC = () => {
               closePrice: longCeCached?.closePrice ?? null,
               delta: longCeCached?.delta ?? null,
               theta: longCeCached?.theta ?? null,
+              soldPrice: longCeCached?.soldPrice ?? null,
+              costPrice: longCeCached?.costPrice ?? null,
               statusCode: longCeCached?.statusCode ?? null,
             })
             : fetchOptionWithRateLimitRetry(symbol, longExpiryDate, ceStrike, "C", date),
@@ -449,6 +514,7 @@ const CallCalendar: React.FC = () => {
 
         if (!ceCanUseCache) {
           const shouldSkipCe = ceData.statusCode === 404;
+          const shortSoldPrice = ceCached?.soldPrice ?? cePrice;
           masterOptionData[ceKey] = {
             symbol,
             expiryDate,
@@ -459,6 +525,8 @@ const CallCalendar: React.FC = () => {
             closePrice: cePrice,
             delta: ceData.delta,
             theta: ceData.theta,
+            soldPrice: shortSoldPrice,
+            costPrice: ceData.costPrice ?? null,
             statusCode: ceData.statusCode,
             skipFuture: shouldSkipCe,
           };
@@ -477,6 +545,8 @@ const CallCalendar: React.FC = () => {
             closePrice: pePrice,
             delta: peData.delta,
             theta: peData.theta,
+            soldPrice: peCached?.soldPrice ?? null,
+            costPrice: peCached?.costPrice ?? null,
             statusCode: peData.statusCode,
             skipFuture: shouldSkipPe,
           };
@@ -484,6 +554,7 @@ const CallCalendar: React.FC = () => {
         }
         if (!longCeCanUseCache) {
           const shouldSkipLongCe = longCeData.statusCode === 404;
+          const longCostPrice = longCeCached?.costPrice ?? longCePrice;
           masterOptionData[longCeKey] = {
             symbol,
             expiryDate: longExpiryDate,
@@ -494,6 +565,8 @@ const CallCalendar: React.FC = () => {
             closePrice: longCePrice,
             delta: longCeData.delta,
             theta: longCeData.theta,
+            soldPrice: longCeData.soldPrice ?? null,
+            costPrice: longCostPrice,
             statusCode: longCeData.statusCode,
             skipFuture: shouldSkipLongCe,
           };
@@ -512,6 +585,8 @@ const CallCalendar: React.FC = () => {
             closePrice: longPePrice,
             delta: longPeData.delta,
             theta: longPeData.theta,
+            soldPrice: longPeCached?.soldPrice ?? null,
+            costPrice: longPeCached?.costPrice ?? null,
             statusCode: longPeData.statusCode,
             skipFuture: shouldSkipLongPe,
           };
@@ -542,6 +617,7 @@ const CallCalendar: React.FC = () => {
 
         const row: OptionsAnalysisRowV2 = {
           date: formatDisplayDate(date),
+          apiDate: date,
           closingPrice: stockClosePrice,
           ceStrike,
           peStrike,
@@ -552,6 +628,8 @@ const CallCalendar: React.FC = () => {
               closePrice: cePrice,
               delta: ceData.delta,
               theta: ceData.theta,
+              soldPrice: ceData.soldPrice ?? ceCached?.soldPrice ?? cePrice,
+              costPrice: ceData.costPrice ?? ceCached?.costPrice ?? null,
             }
             : null,
           markChangeCall,
@@ -572,6 +650,8 @@ const CallCalendar: React.FC = () => {
               closePrice: longCePrice,
               delta: longCeData.delta,
               theta: longCeData.theta,
+              soldPrice: longCeData.soldPrice ?? longCeCached?.soldPrice ?? null,
+              costPrice: longCeData.costPrice ?? longCeCached?.costPrice ?? longCePrice,
             }
             : null,
           longPePremiumData: longPePrice !== null
@@ -635,6 +715,7 @@ const CallCalendar: React.FC = () => {
     setResult(null);
     setError(null);
     setCancelRequested(false);
+    setShowChart(true);
     message.success("Form reset");
   };
 
@@ -657,6 +738,49 @@ const CallCalendar: React.FC = () => {
     localStorage.removeItem(MASTER_OPTION_DATA_KEY);
     message.success("Option cache cleared");
   };
+
+  const netValueChartData = result
+    ? result.rows
+        .map((row, index) => {
+          if (!row.cePremiumData || !row.longCePremiumData) {
+            return null;
+          }
+
+          const netValue = NET_VALUE_MULTIPLIER * (
+            row.longCePremiumData.closePrice - row.cePremiumData.closePrice
+          );
+
+          const firstRow = result.rows[0];
+          if (!firstRow?.cePremiumData || !firstRow.longCePremiumData) {
+            return {
+              date: row.date,
+              netValue,
+              percentageChange: null,
+            };
+          }
+
+          const firstNetValue = NET_VALUE_MULTIPLIER * (
+            firstRow.longCePremiumData.closePrice - firstRow.cePremiumData.closePrice
+          );
+
+          const percentageChange =
+            index === 0 || firstNetValue === 0
+              ? 0
+              : ((netValue - firstNetValue) / firstNetValue) * 100;
+
+          return {
+            date: row.date,
+            netValue,
+            percentageChange,
+          };
+        })
+        .filter(
+          (value): value is { date: string; netValue: number; percentageChange: number | null } =>
+            value !== null
+        )
+    : [];
+
+  const tableScrollY = showChart ? "calc(100vh - 420px)" : "calc(100vh - 300px)";
 
   const handleFieldChange = <K extends keyof OptionsInputV2>(field: K, value: OptionsInputV2[K]) => {
     setFormInput((prev) => ({
@@ -688,8 +812,10 @@ const CallCalendar: React.FC = () => {
           row.cePremiumData !== null &&
           row.longCePremiumData !== null
             ? (
-                row.longCePremiumData.closePrice -
-                row.cePremiumData.closePrice
+                NET_VALUE_MULTIPLIER * (
+                  row.longCePremiumData.closePrice -
+                  row.cePremiumData.closePrice
+                )
               ).toFixed(2)
             : "—",
         "Mark change - Call": row.markChangeCall !== null ? row.markChangeCall.toFixed(2) : "—",
@@ -757,11 +883,11 @@ const CallCalendar: React.FC = () => {
       dataIndex: "ceStrike",
       key: "ceStrike",
       width: 120,
-      render: (value: number) => (
+      render: (value: number, record: OptionsAnalysisRowV2) => (
         <Button
           type="link"
           style={{ padding: 0, height: "auto" }}
-          onClick={() => openInputPopup("Call Strike")}
+          onClick={() => openInputPopup("Call Strike", record)}
         >
           {value.toFixed(0)}
         </Button>
@@ -861,7 +987,9 @@ const CallCalendar: React.FC = () => {
           return "—";
         }
 
-        const netValue = record.longCePremiumData.closePrice - record.cePremiumData.closePrice;
+        const netValue = NET_VALUE_MULTIPLIER * (
+          record.longCePremiumData.closePrice - record.cePremiumData.closePrice
+        );
 
         // Calculate percentage change from start date (first row)
         let percentageChange: number | null = null;
@@ -872,7 +1000,9 @@ const CallCalendar: React.FC = () => {
             firstRow.longCePremiumData
           ) {
             const firstNetValue =
-              firstRow.longCePremiumData.closePrice - firstRow.cePremiumData.closePrice;
+              NET_VALUE_MULTIPLIER * (
+                firstRow.longCePremiumData.closePrice - firstRow.cePremiumData.closePrice
+              );
 
             if (firstNetValue !== 0) {
               percentageChange = ((netValue - firstNetValue) / firstNetValue) * 100;
@@ -905,7 +1035,9 @@ const CallCalendar: React.FC = () => {
           return "—";
         }
 
-        const netValue = 12 * record.longCePremiumData.closePrice - 10 * record.cePremiumData.closePrice;
+        const netValue = NET_VALUE_MULTIPLIER * (
+          12 * record.longCePremiumData.closePrice - 10 * record.cePremiumData.closePrice
+        );
 
         // Calculate percentage change from start date (first row)
         let percentageChange: number | null = null;
@@ -916,7 +1048,9 @@ const CallCalendar: React.FC = () => {
             firstRow.longCePremiumData
           ) {
             const firstNetValue =
-              12 * firstRow.longCePremiumData.closePrice - 10 * firstRow.cePremiumData.closePrice;
+              NET_VALUE_MULTIPLIER * (
+                12 * firstRow.longCePremiumData.closePrice - 10 * firstRow.cePremiumData.closePrice
+              );
 
             if (firstNetValue !== 0) {
               percentageChange = ((netValue - firstNetValue) / firstNetValue) * 100;
@@ -1099,12 +1233,17 @@ const CallCalendar: React.FC = () => {
                 <Button icon={<DownloadOutlined />} onClick={downloadCurrentViewAsExcel}>
                   Download Excel
                 </Button>
+                <Button onClick={() => setShowChart((previous) => !previous)}>
+                  {showChart ? "Hide Chart" : "Show Chart"}
+                </Button>
               </Space>
+
+              {showChart && <NetValueChart data={netValueChartData} title="Call Net Value Trend" />}
 
               {result.rows.length === 0 ? (
                 <Empty description="No data to display" />
               ) : (
-                <div style={{ width: "100%", flex: 1, minHeight: 400, overflow: "hidden" }}>
+                <div style={{ width: "100%", flex: 1, minHeight: 0, overflow: "hidden" }}>
                   <Table
                     columns={columns}
                     dataSource={result.rows.map((row, idx) => ({
@@ -1112,7 +1251,7 @@ const CallCalendar: React.FC = () => {
                       key: idx,
                     }))}
                     pagination={{ pageSize: 50 }}
-                    scroll={{ x: "max-content", y: "calc(100vh - 320px)" }}
+                    scroll={{ x: "max-content", y: tableScrollY }}
                     size="small"
                   />
                 </div>
@@ -1157,20 +1296,50 @@ const CallCalendar: React.FC = () => {
         <Space direction="vertical" style={{ width: "100%" }} size="middle">
           <div>
             <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Symbol</label>
-            <Input value={formInput.symbol} readOnly />
+            <Input value={selectedOptionContext?.symbol ?? ""} readOnly />
           </div>
           <div>
             <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Strike Price</label>
-            <Input value={String(formInput.strikePrice)} readOnly />
+            <Input
+              type="number"
+              min={0}
+              placeholder="Edit strike price"
+              value={selectedOptionContext ? String(selectedOptionContext.strikePrice) : ""}
+              onChange={(event) => updatePopupStrikePrice(event.target.value)}
+            />
           </div>
           <div>
             <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Date</label>
-            <Input value={formInput.date} readOnly />
+            <Input type="date" value={selectedOptionContext?.date ?? ""} readOnly />
           </div>
           <div>
             <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Expiry Date</label>
-            <Input value={formInput.expiryDate} readOnly />
+            <Input type="date" value={selectedOptionContext?.expiryDate ?? ""} readOnly />
           </div>
+          <div>
+            <Button
+              type="primary"
+              onClick={handleFetchOptionDetails}
+              loading={optionDetailsLoading}
+              disabled={!selectedOptionContext}
+            >
+              Get Option Details
+            </Button>
+          </div>
+          {optionDetails && (
+            <div style={{ backgroundColor: "#f5f5f5", borderRadius: "4px", padding: "10px" }}>
+              <div>Status: {optionDetails.statusCode ?? "N/A"}</div>
+              <div>Open: {optionDetails.openPrice !== null ? optionDetails.openPrice.toFixed(2) : "—"}</div>
+              <div>Close: {optionDetails.closePrice !== null ? optionDetails.closePrice.toFixed(2) : "—"}</div>
+              <div>Delta: {optionDetails.delta !== null ? optionDetails.delta.toFixed(4) : "—"}</div>
+              <div>Theta: {optionDetails.theta !== null ? optionDetails.theta.toFixed(4) : "—"}</div>
+            </div>
+          )}
+          {!optionDetails && !optionDetailsLoading && (
+            <div style={{ color: "#888", fontSize: "12px" }}>
+              Click "Get Option Details" to load option open/close and greeks.
+            </div>
+          )}
           <div>
             <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Long Expiry Date</label>
             <Input value={formInput.longExpiryDate} readOnly />

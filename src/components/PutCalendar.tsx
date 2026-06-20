@@ -3,10 +3,11 @@
  * Accepts JSON input with array of objects, calls Massive.com API, and displays results
  */
 
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   Button,
   Input,
+  Select,
   Space,
   Table,
   Alert,
@@ -28,6 +29,7 @@ import dayjs from "dayjs";
 import * as XLSX from "xlsx";
 import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
 import tradingDates2026Json from "../assets/trading_dates_2026.json";
+import NetValueChart from "./NetValueChart";
 import type {
   OptionsInput,
   OptionsAnalysisRow,
@@ -40,6 +42,7 @@ interface OptionsInputV2 extends OptionsInput {
 
 interface OptionsAnalysisRowV2 extends Omit<OptionsAnalysisRow, "closingPrice"> {
   closingPrice: number | null;
+  apiDate: string;
   longCePremiumData: StrikePremium | null;
   longPePremiumData: StrikePremium | null;
 }
@@ -47,6 +50,33 @@ interface OptionsAnalysisRowV2 extends Omit<OptionsAnalysisRow, "closingPrice"> 
 interface AnalysisResult {
   rows: OptionsAnalysisRowV2[];
   inputData: OptionsInputV2[];
+}
+
+interface PhaseGridResult {
+  phaseNumber: number;
+  startDate: string;
+  endDate: string;
+  analysis: AnalysisResult;
+}
+
+interface SelectedOptionContext {
+  symbol: string;
+  date: string;
+  expiryDate: string;
+  longExpiryDate: string;
+  shortGivenExpiryDate: string;
+  shortCalculatedExpiryDate: string;
+  longGivenExpiryDate: string;
+  longCalculatedExpiryDate: string;
+  shortStrikePrice: number;
+  longStrikePrice: number;
+  optionType: "P";
+}
+
+interface RowStrikeEntry {
+  date: string;
+  shortStrikePrice: number;
+  longStrikePrice: number;
 }
 
 interface CachedOptionResponse {
@@ -59,6 +89,8 @@ interface CachedOptionResponse {
   closePrice: number | null;
   delta: number | null;
   theta: number | null;
+  soldPrice: number | null;
+  costPrice: number | null;
   statusCode: number | null;
   skipFuture: boolean;
 }
@@ -80,8 +112,11 @@ const MASTER_STOCK_DATA_KEY = "masterStockData";
 const tradingDates2026 = new Set<string>(tradingDates2026Json as string[]);
 const RATE_LIMIT_WAIT_MS = 2_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
+const NET_VALUE_MULTIPLIER = 10;
+const LONG_EXPIRY_MIN_DTE_DAYS = 100;
+const LONG_EXPIRY_MAX_DTE_DAYS = 150;
 const DEFAULT_INPUT: OptionsInputV2 = {
-  expiryDate: "2026-06-30",
+  expiryDate: "",
   longExpiryDate: "2026-12-31",
   date: "2026-01-01",
   strikePrice: 700,
@@ -97,14 +132,368 @@ const PutCalendar: React.FC = () => {
   const [cancelRequested, setCancelRequested] = useState(false);
   const [isInputPopupOpen, setIsInputPopupOpen] = useState(false);
   const [selectedStrikeLabel, setSelectedStrikeLabel] = useState<string>("Put Strike");
+  const [selectedOptionContext, setSelectedOptionContext] = useState<SelectedOptionContext | null>(null);
+  const [rowStrikeEntries, setRowStrikeEntries] = useState<RowStrikeEntry[]>([]);
+  const [optionDetailsLoading, setOptionDetailsLoading] = useState(false);
+  const dateChangeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [optionDetails, setOptionDetails] = useState<{
+    openPrice: number | null;
+    closePrice: number | null;
+    delta: number | null;
+    theta: number | null;
+    statusCode: number | null;
+  } | null>(null);
 
-  const openInputPopup = (strikeLabel: string) => {
+  // Additional phases (Phase 2, Phase 3, ...) generated after Phase 1
+  const [phaseResults, setPhaseResults] = useState<PhaseGridResult[]>([]);
+  const [phaseLoading, setPhaseLoading] = useState(false);
+  const [phaseError, setPhaseError] = useState<string | null>(null);
+  const [phaseSplitInfo, setPhaseSplitInfo] = useState<{
+    phase1StartDate: string;
+    phase1EndDate: string;
+    phase2StartDate: string;
+  } | null>(null);
+
+  // Chart visibility toggles
+  const [showChart1, setShowChart1] = useState(false);
+  const [phaseChartVisibility, setPhaseChartVisibility] = useState<Record<number, boolean>>({});
+  const [phase1SelectedRowKeys, setPhase1SelectedRowKeys] = useState<React.Key[]>([]);
+  const [phaseSelectedRowKeys, setPhaseSelectedRowKeys] = useState<Record<number, React.Key[]>>({});
+
+  useEffect(() => {
+    return () => {
+      if (dateChangeTimeoutRef.current) {
+        clearTimeout(dateChangeTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const openInputPopup = (strikeLabel: string, record: OptionsAnalysisRowV2) => {
+    const existingRowStrike = rowStrikeEntries.find((entry) => entry.date === record.apiDate);
+    const shortGivenExpiryDate = formInput.expiryDate && dayjs(formInput.expiryDate).isValid()
+      ? formInput.expiryDate
+      : "";
+    const shortCalculatedExpiryDate =
+      getExpiryCandidates30To45Days(record.apiDate, formInput.expiryDate)[0] ?? record.apiDate;
+    const longGivenExpiryDate = formInput.longExpiryDate && dayjs(formInput.longExpiryDate).isValid()
+      ? formInput.longExpiryDate
+      : "";
+    const longCalculatedExpiryDate =
+      getExpiryCandidates100To150Days(record.apiDate, formInput.longExpiryDate)[0] ?? record.apiDate;
+
+    const nextOptionContext: SelectedOptionContext = {
+      symbol: formInput.symbol.trim().toUpperCase(),
+      date: record.apiDate,
+      expiryDate: shortGivenExpiryDate || shortCalculatedExpiryDate,
+      longExpiryDate: longGivenExpiryDate || longCalculatedExpiryDate,
+      shortGivenExpiryDate,
+      shortCalculatedExpiryDate,
+      longGivenExpiryDate,
+      longCalculatedExpiryDate,
+      shortStrikePrice: existingRowStrike?.shortStrikePrice ?? record.peStrike,
+      longStrikePrice:
+        existingRowStrike?.longStrikePrice ??
+        record.longPePremiumData?.strike ??
+        (record.peStrike - 5),
+      optionType: "P",
+    };
+
+    console.log("PutCalendar modal opened", nextOptionContext);
     setSelectedStrikeLabel(strikeLabel);
+    setSelectedOptionContext(nextOptionContext);
+    setOptionDetails(null);
     setIsInputPopupOpen(true);
   };
 
   const closeInputPopup = () => {
     setIsInputPopupOpen(false);
+  };
+
+  const updatePopupStrikePrice = (value: string, strikeType: "short" | "long") => {
+    const nextStrikePrice = value === "" ? 0 : Number(value);
+    setOptionDetails(null);
+    setSelectedOptionContext((previous) =>
+      previous
+        ? {
+            ...previous,
+            shortStrikePrice:
+              strikeType === "short" ? nextStrikePrice : previous.shortStrikePrice,
+            longStrikePrice:
+              strikeType === "long" ? nextStrikePrice : previous.longStrikePrice,
+          }
+        : previous
+    );
+  };
+
+  const updatePopupDate = (value: string, field: "date" | "expiryDate" | "longExpiryDate") => {
+    setOptionDetails(null);
+    setSelectedOptionContext((previous) =>
+      previous
+        ? {
+            ...previous,
+            [field]: value,
+          }
+        : previous
+    );
+  };
+
+  const getPreviousTradingDate = (date: string): string | null => {
+    for (let daysBack = 1; daysBack <= 5; daysBack += 1) {
+      const candidate = dayjs(date).subtract(daysBack, "day").format("YYYY-MM-DD");
+      if (tradingDates2026.has(candidate)) {
+        return candidate;
+      }
+    }
+
+    return null;
+  };
+
+  const loadOrFetchOptionData = async (
+    masterOptionData: MasterOptionData,
+    symbol: string,
+    expiryDate: string,
+    strikePrice: number,
+    optionType: "C" | "P",
+    date: string
+  ): Promise<CachedOptionResponse> => {
+    const cacheKey = getCacheKey(symbol, expiryDate, strikePrice, optionType, date);
+    const cached = masterOptionData[cacheKey];
+
+    if (cached) {
+      return cached;
+    }
+
+    const response = await fetchOptionWithRateLimitRetry(symbol, expiryDate, strikePrice, optionType, date);
+    const normalizedResponse: CachedOptionResponse = {
+      symbol,
+      expiryDate,
+      strikePrice,
+      optionType,
+      date,
+      openPrice: response.openPrice,
+      closePrice: response.closePrice,
+      delta: response.delta,
+      theta: response.theta,
+      soldPrice: response.soldPrice ?? null,
+      costPrice: response.costPrice ?? null,
+      statusCode: response.statusCode,
+      skipFuture: response.statusCode === 404,
+    };
+
+    masterOptionData[cacheKey] = normalizedResponse;
+    return normalizedResponse;
+  };
+
+  const updateStrikePriceAndRefreshRow = async (
+    optionContextOverride?: SelectedOptionContext,
+    rerunAnalysisAfterUpdate = false
+  ) => {
+    const activeOptionContext = optionContextOverride ?? selectedOptionContext;
+    if (!activeOptionContext || !result) return;
+
+    const nextShortStrikePrice = Number(activeOptionContext.shortStrikePrice);
+    const nextLongStrikePrice = Number(activeOptionContext.longStrikePrice);
+    if (
+      !Number.isFinite(nextShortStrikePrice) ||
+      !Number.isFinite(nextLongStrikePrice) ||
+      nextShortStrikePrice < 0 ||
+      nextLongStrikePrice < 0
+    ) {
+      message.error("Short and long strike prices must be valid non-negative numbers");
+      return;
+    }
+
+    if (
+      !dayjs(activeOptionContext.date).isValid() ||
+      !dayjs(activeOptionContext.longExpiryDate).isValid()
+    ) {
+      message.error("Date and long expiry date must be valid");
+      return;
+    }
+
+    if (!isLongExpiryInRange(activeOptionContext.date, activeOptionContext.longExpiryDate)) {
+      message.error("Long expiry date must be more than 100 and up to 150 days from date");
+      return;
+    }
+
+    setOptionDetailsLoading(true);
+
+    try {
+      const symbol = activeOptionContext.symbol.trim().toUpperCase();
+      const date = activeOptionContext.date;
+      const shortExpiryDate = formatExpiryDate(activeOptionContext.expiryDate);
+      const longExpiryDate = formatExpiryDate(activeOptionContext.longExpiryDate);
+      const masterOptionData = loadMasterOptionData();
+
+      const targetDates = result.rows
+        .map((row) => row.apiDate)
+        .filter((rowDate) => rowDate >= date);
+
+      const updatesByDate: Record<
+        string,
+        {
+          peData: CachedOptionResponse;
+          longPeData: CachedOptionResponse;
+          previousPeData: CachedOptionResponse | null;
+        }
+      > = {};
+
+      for (const targetDate of targetDates) {
+        const previousDate = getPreviousTradingDate(targetDate);
+        const [peData, longPeData, previousPeData] = await Promise.all([
+          loadOrFetchOptionData(masterOptionData, symbol, shortExpiryDate, nextShortStrikePrice, "P", targetDate),
+          loadOrFetchOptionData(masterOptionData, symbol, longExpiryDate, nextLongStrikePrice, "P", targetDate),
+          previousDate
+            ? loadOrFetchOptionData(masterOptionData, symbol, shortExpiryDate, nextShortStrikePrice, "P", previousDate)
+            : Promise.resolve(null),
+        ]);
+
+        updatesByDate[targetDate] = {
+          peData,
+          longPeData,
+          previousPeData,
+        };
+      }
+
+      saveMasterOptionData(masterOptionData);
+      const selectedDateUpdate = updatesByDate[date];
+      if (selectedDateUpdate) {
+        setOptionDetails(selectedDateUpdate.peData);
+      }
+
+      const nextFormInput: OptionsInputV2 = {
+        ...formInput,
+        symbol,
+        date,
+        expiryDate: activeOptionContext.expiryDate,
+        longExpiryDate: activeOptionContext.longExpiryDate,
+        strikePrice: nextShortStrikePrice,
+      };
+
+      setFormInput(nextFormInput);
+      setResult((previous) => {
+        if (!previous) {
+          return previous;
+        }
+
+        const updatedRows = previous.rows.map((row) => {
+          if (row.apiDate < date) {
+            return row;
+          }
+
+          const dateUpdate = updatesByDate[row.apiDate];
+          if (!dateUpdate) {
+            return row;
+          }
+
+          const peData = dateUpdate.peData;
+          const longPeData = dateUpdate.longPeData;
+          const previousPeData = dateUpdate.previousPeData;
+
+          const existingShortPremium = row.pePremiumData;
+          const existingLongPremium = row.longPePremiumData;
+          const nextShortClosePrice = peData.closePrice;
+          const nextLongClosePrice = longPeData.closePrice;
+
+          return {
+            ...row,
+            peStrike: nextShortStrikePrice,
+            pePremiumData:
+              nextShortClosePrice !== null
+                ? {
+                    expiryDate: formatDisplayDate(activeOptionContext.expiryDate),
+                    strike: nextShortStrikePrice,
+                    closePrice: nextShortClosePrice,
+                    delta: peData.delta,
+                    theta: peData.theta,
+                    soldPrice: peData.soldPrice ?? existingShortPremium?.soldPrice ?? nextShortClosePrice,
+                    costPrice: peData.costPrice ?? existingShortPremium?.costPrice ?? null,
+                  }
+                : null,
+            longPePremiumData:
+              nextLongClosePrice !== null
+                ? {
+                    expiryDate: formatDisplayDate(activeOptionContext.longExpiryDate),
+                    strike: nextLongStrikePrice,
+                    closePrice: nextLongClosePrice,
+                    delta: longPeData.delta,
+                    theta: longPeData.theta,
+                    soldPrice: longPeData.soldPrice ?? existingLongPremium?.soldPrice ?? null,
+                    costPrice: longPeData.costPrice ?? existingLongPremium?.costPrice ?? nextLongClosePrice,
+                  }
+                : null,
+            markChangePut:
+              nextShortClosePrice !== null && previousPeData !== null && previousPeData.closePrice !== null
+                ? nextShortClosePrice - previousPeData.closePrice
+                : null,
+          };
+        });
+
+        return {
+          ...previous,
+          rows: updatedRows,
+        };
+      });
+
+      setRowStrikeEntries((previous) => {
+        const existingDates = new Set(previous.map((entry) => entry.date));
+        const updated = previous.map((entry) =>
+          entry.date >= date
+            ? {
+                ...entry,
+                shortStrikePrice: nextShortStrikePrice,
+                longStrikePrice: nextLongStrikePrice,
+              }
+            : entry
+        );
+
+        for (const targetDate of targetDates) {
+          if (!existingDates.has(targetDate)) {
+            updated.push({
+              date: targetDate,
+              shortStrikePrice: nextShortStrikePrice,
+              longStrikePrice: nextLongStrikePrice,
+            });
+          }
+        }
+
+        updated.sort((a, b) => a.date.localeCompare(b.date));
+        return updated;
+      });
+
+      if (rerunAnalysisAfterUpdate) {
+        console.log("PutCalendar popup open triggered analysis rerun", nextFormInput);
+        await handleAnalyze(nextFormInput);
+      }
+
+      message.success(
+        `Updated short strike ${nextShortStrikePrice} and long strike ${nextLongStrikePrice} for selected row and subsequent rows`
+      );
+    } catch {
+      message.error("Failed to update strike price");
+    } finally {
+      setOptionDetailsLoading(false);
+    }
+  };
+
+  const handleFetchOptionDetails = async () => {
+    if (!selectedOptionContext) return;
+
+    setOptionDetailsLoading(true);
+    try {
+      const response = await fetchOptionWithRateLimitRetry(
+        selectedOptionContext.symbol,
+        formatExpiryDate(selectedOptionContext.expiryDate),
+        selectedOptionContext.shortStrikePrice,
+        selectedOptionContext.optionType,
+        selectedOptionContext.date
+      );
+      setOptionDetails(response);
+    } catch {
+      message.error("Failed to fetch option details");
+    } finally {
+      setOptionDetailsLoading(false);
+    }
   };
 
   const getCacheKey = (
@@ -203,37 +592,290 @@ const PutCalendar: React.FC = () => {
     return dayjs(dateStr).format("MM/DD/YY");
   };
 
+  const roundToNearestFive = (value: number): number => {
+    return Math.round(value / 5) * 5;
+  };
+
+  const getLongExpiryDteDays = (baseDate: string, longExpiryDate: string): number => {
+    return dayjs(longExpiryDate).startOf("day").diff(dayjs(baseDate).startOf("day"), "day");
+  };
+
+  const isLongExpiryInRange = (baseDate: string, longExpiryDate: string): boolean => {
+    const dteDays = getLongExpiryDteDays(baseDate, longExpiryDate);
+    return dteDays > LONG_EXPIRY_MIN_DTE_DAYS && dteDays <= LONG_EXPIRY_MAX_DTE_DAYS;
+  };
+
+  const isProvidedStrikePrice = (value: number): boolean => {
+    return Number.isFinite(value) && value > 0;
+  };
+
+  const confirmStrikeChoice = (
+    providedStrikePrice: number,
+    calculatedStrikePrice: number,
+    tradeDate: string
+  ): Promise<"provided" | "calculated"> => {
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = (choice: "provided" | "calculated") => {
+        if (settled) return;
+        settled = true;
+        resolve(choice);
+      };
+
+      Modal.confirm({
+        title: "Strike Price Confirmation",
+        content: `Date ${tradeDate}: provided strike ${providedStrikePrice} differs by more than 3% from calculated strike ${calculatedStrikePrice}.`,
+        okText: `Use Provided (${providedStrikePrice})`,
+        cancelText: `Use Calculated (${calculatedStrikePrice})`,
+        onOk: () => settle("provided"),
+        onCancel: () => settle("calculated"),
+      });
+    });
+  };
+
+  const getStrikeCandidatesFromClose = (closePrice: number): number[] => {
+    const baseCandidates = [0.02, 0.0175, 0.015].map((discountPct) =>
+      roundToNearestFive(closePrice * (1 - discountPct))
+    );
+    const expanded = baseCandidates.flatMap((strike) => [strike - 5, strike, strike + 5]);
+    return Array.from(new Set(expanded.filter((strike) => strike > 0)));
+  };
+
+  const getExpiryCandidates30To45Days = (baseDate: string, preferredExpiryDate: string): string[] => {
+    const start = dayjs(baseDate).add(30, "day");
+    const end = dayjs(baseDate).add(45, "day");
+
+    const candidates = Array.from(tradingDates2026)
+      .filter((candidateDate) => {
+        const candidate = dayjs(candidateDate);
+        return (
+          candidate.isValid() &&
+          (candidate.isAfter(start, "day") || candidate.isSame(start, "day")) &&
+          (candidate.isBefore(end, "day") || candidate.isSame(end, "day"))
+        );
+      })
+      .sort((a, b) => dayjs(a).valueOf() - dayjs(b).valueOf());
+
+    if (candidates.length === 0) {
+      return preferredExpiryDate ? [preferredExpiryDate] : [];
+    }
+
+    if (preferredExpiryDate && candidates.includes(preferredExpiryDate)) {
+      return [preferredExpiryDate, ...candidates.filter((candidate) => candidate !== preferredExpiryDate)];
+    }
+
+    return candidates;
+  };
+
+  const getExpiryCandidates100To150Days = (baseDate: string, preferredExpiryDate: string): string[] => {
+    const start = dayjs(baseDate).add(LONG_EXPIRY_MIN_DTE_DAYS, "day");
+    const end = dayjs(baseDate).add(LONG_EXPIRY_MAX_DTE_DAYS, "day");
+
+    const candidates = Array.from(tradingDates2026)
+      .filter((candidateDate) => {
+        const candidate = dayjs(candidateDate);
+        return (
+          candidate.isValid() &&
+          candidate.isAfter(start, "day") &&
+          (candidate.isBefore(end, "day") || candidate.isSame(end, "day"))
+        );
+      })
+      .sort((a, b) => dayjs(a).valueOf() - dayjs(b).valueOf());
+
+    if (candidates.length === 0) {
+      return preferredExpiryDate ? [preferredExpiryDate] : [];
+    }
+
+    if (preferredExpiryDate && candidates.includes(preferredExpiryDate)) {
+      return [preferredExpiryDate, ...candidates.filter((candidate) => candidate !== preferredExpiryDate)];
+    }
+
+    return candidates;
+  };
+
+  const getLongPutRetryStrikeCandidatesFromClose = (closePrice: number): number[] => {
+    const pctSteps = [-0.05, -0.04, -0.03, -0.02, -0.01, 0, 0.01, 0.02, 0.03, 0.04, 0.05];
+    const strikes = pctSteps.map((pct) => roundToNearestFive(closePrice * (1 + pct)));
+    return Array.from(new Set(strikes.filter((strike) => Number.isFinite(strike) && strike > 0)));
+  };
+
+  const handleDateChangeAndRunSimulation = async (nextDate: string) => {
+    const normalizedDate = dayjs(nextDate).isValid() ? dayjs(nextDate).format("YYYY-MM-DD") : nextDate;
+
+    setFormInput((previous) => ({
+      ...previous,
+      date: normalizedDate,
+    }));
+
+    if (!dayjs(normalizedDate).isValid()) {
+      return;
+    }
+
+    const symbol = formInput.symbol.trim().toUpperCase();
+    if (!symbol) {
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const stockResponse = await fetchStockWithRateLimitRetry(symbol, normalizedDate);
+      const closePrice = stockResponse.closePrice;
+
+      if (closePrice === null) {
+        throw new Error("Unable to fetch close price for selected date");
+      }
+
+      const strikeCandidates = getStrikeCandidatesFromClose(closePrice);
+      const expiryCandidates = getExpiryCandidates30To45Days(normalizedDate, formInput.expiryDate);
+      const longExpiryCandidates = getExpiryCandidates100To150Days(normalizedDate, formInput.longExpiryDate).slice(0, 4);
+      const longStrikeCandidatesFromClose = getLongPutRetryStrikeCandidatesFromClose(closePrice);
+
+      let resolvedStrikePrice = strikeCandidates[0] ?? formInput.strikePrice;
+      let resolvedExpiryDate = expiryCandidates[0] ?? (formInput.expiryDate || normalizedDate);
+      let resolvedLongExpiryDate = longExpiryCandidates[0] ?? formInput.longExpiryDate;
+
+      let foundValidCombination = false;
+      for (const expiryCandidate of expiryCandidates) {
+        const formattedExpiryCandidate = formatExpiryDate(expiryCandidate);
+
+        for (const strikeCandidate of strikeCandidates) {
+          const shortOption = await fetchOptionWithRateLimitRetry(
+            symbol,
+            formattedExpiryCandidate,
+            strikeCandidate,
+            "P",
+            normalizedDate
+          );
+
+          const shortValid = shortOption.statusCode !== 404 && shortOption.closePrice !== null;
+          if (!shortValid) {
+            continue;
+          }
+
+          let longValid = false;
+          for (const longExpiryCandidate of longExpiryCandidates) {
+            const formattedLongExpiry = formatExpiryDate(longExpiryCandidate);
+            const computedLongStrike = strikeCandidate - 5;
+            const longStrikeCandidates = Array.from(
+              new Set([computedLongStrike, ...longStrikeCandidatesFromClose])
+            );
+            for (const longStrikeCandidate of longStrikeCandidates) {
+              const longOption = await fetchOptionWithRateLimitRetry(
+                symbol,
+                formattedLongExpiry,
+                longStrikeCandidate,
+                "P",
+                normalizedDate
+              );
+
+              if (longOption.statusCode !== 404 && longOption.closePrice !== null) {
+                resolvedLongExpiryDate = longExpiryCandidate;
+                longValid = true;
+                break;
+              }
+            }
+
+            if (longValid) {
+              break;
+            }
+          }
+
+          if (shortValid && longValid) {
+            resolvedStrikePrice = strikeCandidate;
+            resolvedExpiryDate = expiryCandidate;
+            foundValidCombination = true;
+            break;
+          }
+        }
+
+        if (foundValidCombination) {
+          break;
+        }
+      }
+
+      const providedStrikePrice = isProvidedStrikePrice(formInput.strikePrice)
+        ? roundToNearestFive(formInput.strikePrice)
+        : null;
+      if (providedStrikePrice !== null) {
+        const diffPercent =
+          resolvedStrikePrice !== 0
+            ? (Math.abs(providedStrikePrice - resolvedStrikePrice) / Math.abs(resolvedStrikePrice)) * 100
+            : 0;
+
+        if (diffPercent > 3) {
+          const choice = await confirmStrikeChoice(providedStrikePrice, resolvedStrikePrice, normalizedDate);
+          if (choice === "provided") {
+            resolvedStrikePrice = providedStrikePrice;
+          }
+        } else {
+          resolvedStrikePrice = providedStrikePrice;
+        }
+      }
+
+      const nextInput: OptionsInputV2 = {
+        ...formInput,
+        symbol,
+        date: normalizedDate,
+        strikePrice: resolvedStrikePrice,
+        expiryDate: resolvedExpiryDate,
+        longExpiryDate: resolvedLongExpiryDate,
+      };
+
+      setFormInput(nextInput);
+      await handleAnalyze(nextInput);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to update simulation for selected date";
+      setError(msg);
+      message.error(msg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   /**
    * Parse form input and validate structure
    */
-  const parseInput = (): OptionsInputV2[] => {
+  const parseInput = (inputOverride?: OptionsInputV2): OptionsInputV2[] => {
+    const sourceInput = inputOverride ?? formInput;
     const normalizedInput: OptionsInputV2 = {
-      expiryDate: formInput.expiryDate,
-      longExpiryDate: formInput.longExpiryDate,
-      date: formInput.date,
-      strikePrice: formInput.strikePrice,
-      symbol: formInput.symbol.trim(),
+      expiryDate: sourceInput.expiryDate,
+      longExpiryDate: sourceInput.longExpiryDate,
+      date: sourceInput.date,
+      strikePrice: sourceInput.strikePrice,
+      symbol: sourceInput.symbol.trim(),
     };
 
     if (
-      !normalizedInput.expiryDate ||
-      !normalizedInput.longExpiryDate ||
       !normalizedInput.date ||
       !normalizedInput.symbol
     ) {
-      throw new Error("All five input fields are required");
-    }
-
-    if (!Number.isFinite(normalizedInput.strikePrice)) {
-      throw new Error("Strike price must be a finite number");
+      throw new Error("Symbol and date are required");
     }
 
     if (
-      !dayjs(normalizedInput.expiryDate).isValid() ||
-      !dayjs(normalizedInput.longExpiryDate).isValid() ||
-      !dayjs(normalizedInput.date).isValid()
+      normalizedInput.expiryDate && !dayjs(normalizedInput.expiryDate).isValid()
     ) {
-      throw new Error("Expiry date, long expiry date, and date must be in YYYY-MM-DD format");
+      throw new Error("Expiry date must be in YYYY-MM-DD format");
+    }
+
+    if (
+      normalizedInput.longExpiryDate &&
+      !dayjs(normalizedInput.longExpiryDate).isValid()
+    ) {
+      throw new Error("Long expiry date must be in YYYY-MM-DD format");
+    }
+
+    if (!dayjs(normalizedInput.date).isValid()) {
+      throw new Error("Date must be in YYYY-MM-DD format");
+    }
+
+    if (normalizedInput.longExpiryDate) {
+      const dteDays = getLongExpiryDteDays(normalizedInput.date, normalizedInput.longExpiryDate);
+      if (dteDays <= LONG_EXPIRY_MIN_DTE_DAYS || dteDays > LONG_EXPIRY_MAX_DTE_DAYS) {
+        throw new Error("Long expiry date must be 101 to 150 days after date");
+      }
     }
 
     return [normalizedInput];
@@ -245,9 +887,10 @@ const PutCalendar: React.FC = () => {
 
     for (const input of inputs) {
       const start = dayjs(input.date);
-      const end = dayjs(input.expiryDate);
+      const hasValidExpiryDate = Boolean(input.expiryDate && dayjs(input.expiryDate).isValid());
+      const end = hasValidExpiryDate ? dayjs(input.expiryDate) : dayjs(input.date).add(45, "day");
 
-      if (start.isAfter(end)) {
+      if (hasValidExpiryDate && start.isAfter(end)) {
         throw new Error(
           `Invalid range for ${input.symbol}: date (${input.date}) cannot be after expiryDate (${input.expiryDate})`
         );
@@ -284,23 +927,36 @@ const PutCalendar: React.FC = () => {
   /**
    * Main analysis function
    */
-  const handleAnalyze = async () => {
+  const handleAnalyze = async (inputOverride?: OptionsInputV2) => {
     setError(null);
     setResult(null);
+    setPhaseResults([]);
+    setPhaseError(null);
+    setShowChart1(false);
+    setPhaseChartVisibility({});
+    setPhase1SelectedRowKeys([]);
+    setPhaseSelectedRowKeys({});
+    setPhaseSplitInfo(null);
     setLoading(true);
     setCancelRequested(false);
 
     try {
-      const inputData = parseInput();
+      const inputData = parseInput(inputOverride);
       const expandedInputData = expandInputData(inputData);
       const masterOptionData = loadMasterOptionData();
       const masterStockData = loadMasterStockData();
       let cacheUpdated = false;
       let stockCacheUpdated = false;
       let sawRateLimit = false;
+      let activeStrikePrice: number | null = null;
+      let activeExpiryDate: string | null = null;
+      let phase1CutoffShortExpiryDate: string | null = null;
+      let activeLongExpiryDate: string | null = null;
+      let activeLongStrikePrice: number | null = null;
 
       const rows: OptionsAnalysisRowV2[] = [];
       setResult({ rows: [], inputData });
+      setRowStrikeEntries([]);
 
       // Process each input row independently so each row keeps its own strike/symbol/expiry/date
       for (const input of expandedInputData) {
@@ -309,24 +965,133 @@ const PutCalendar: React.FC = () => {
           break;
         }
         const date = input.date;
-        const strikePrice = input.strikePrice;
         const symbol = input.symbol.toUpperCase();
-        const expiryDate = formatExpiryDate(input.expiryDate);
-        const longExpiryDate = formatExpiryDate(input.longExpiryDate);
-        const ceStrike = strikePrice + 0;//temp 0
-        const peStrike = strikePrice - 0;// temp 0 
+
+        if (activeExpiryDate === null) {
+          const providedExpiryDate = input.expiryDate;
+          if (providedExpiryDate && dayjs(providedExpiryDate).isValid()) {
+            activeExpiryDate = providedExpiryDate;
+          } else {
+            const candidates = getExpiryCandidates30To45Days(date, "");
+            if (candidates.length > 0) {
+              activeExpiryDate = candidates[0];
+            } else {
+              // No trading dates in the 30-45 day window — walk forward from +30 days
+              // to find the nearest available trading date
+              let fallback: string | null = null;
+              for (let daysAhead = 30; daysAhead <= 90; daysAhead++) {
+                const candidate = dayjs(date).add(daysAhead, "day").format("YYYY-MM-DD");
+                if (tradingDates2026.has(candidate)) {
+                  fallback = candidate;
+                  break;
+                }
+              }
+              if (!fallback) {
+                throw new Error(`No trading date found for short expiry (30-90 days from ${date})`);
+              }
+              activeExpiryDate = fallback;
+            }
+          }
+
+          phase1CutoffShortExpiryDate = activeExpiryDate;
+        }
+
+        if (
+          phase1CutoffShortExpiryDate &&
+          dayjs(date).isAfter(dayjs(phase1CutoffShortExpiryDate), "day")
+        ) {
+          break;
+        }
+
+        const expiryDate = formatExpiryDate(activeExpiryDate);
+        const stockKey = `${symbol}|${date}`;
+        const stockCached = masterStockData[stockKey];
+
+        const stockCanUseCache = Boolean(
+          stockCached &&
+          (stockCached.openPrice !== null || stockCached.closePrice !== null)
+        );
+
+        const stockData = stockCanUseCache
+          ? {
+              openPrice: stockCached?.openPrice ?? null,
+              closePrice: stockCached?.closePrice ?? null,
+              statusCode: stockCached?.statusCode ?? null,
+            }
+          : await fetchStockWithRateLimitRetry(symbol, date);
+
+        if (stockData.statusCode === 429) {
+          sawRateLimit = true;
+        }
+
+        const stockClosePrice = stockData.closePrice;
+
+        if (activeStrikePrice === null) {
+          const calculatedStrikePrice = stockClosePrice !== null
+            ? roundToNearestFive(stockClosePrice * (1 - 0.0175))
+            : null;
+
+          if (calculatedStrikePrice === null || !Number.isFinite(calculatedStrikePrice) || calculatedStrikePrice <= 0) {
+            throw new Error("Unable to determine strike price from close price on first row");
+          }
+
+          activeStrikePrice = calculatedStrikePrice;
+        }
+
+        const peStrike = activeStrikePrice;
+        const ceStrike = peStrike;
+
+        if (activeLongExpiryDate === null || activeLongStrikePrice === null) {
+          const longExpiryCandidates = getExpiryCandidates100To150Days(date, input.longExpiryDate).slice(0, 4);
+          const longStrikeCandidates = [peStrike - 5];
+
+          let longFound = false;
+          for (const longExpiryCandidate of longExpiryCandidates) {
+            const formattedLongExpiryCandidate = formatExpiryDate(longExpiryCandidate);
+            for (const longStrikeCandidate of longStrikeCandidates) {
+              const longOptionCandidate = await fetchOptionWithRateLimitRetry(
+                symbol,
+                formattedLongExpiryCandidate,
+                longStrikeCandidate,
+                "P",
+                date
+              );
+
+              if (longOptionCandidate.statusCode !== 404 && longOptionCandidate.closePrice !== null) {
+                activeLongExpiryDate = longExpiryCandidate;
+                activeLongStrikePrice = longStrikeCandidate;
+                longFound = true;
+                break;
+              }
+            }
+
+            if (longFound) {
+              break;
+            }
+          }
+
+          if (!longFound) {
+            activeLongExpiryDate =
+              longExpiryCandidates[0] ??
+              (input.longExpiryDate && dayjs(input.longExpiryDate).isValid() ? input.longExpiryDate : date);
+            activeLongStrikePrice = peStrike - 5;
+          }
+        }
+
+        const resolvedLongExpiryDate = activeLongExpiryDate ?? date;
+        const resolvedLongPeStrike = activeLongStrikePrice ?? peStrike;
+        const longExpiryDate = formatExpiryDate(resolvedLongExpiryDate);
+        const longPeStrike = resolvedLongPeStrike;
 
         const ceKey = getCacheKey(symbol, expiryDate, ceStrike, "C", date);
         const peKey = getCacheKey(symbol, expiryDate, peStrike, "P", date);
         const longCeKey = getCacheKey(symbol, longExpiryDate, ceStrike, "C", date);
-        const longPeKey = getCacheKey(symbol, longExpiryDate, peStrike, "P", date);
-        const stockKey = `${symbol}|${date}`;
+        const longPeKey = getCacheKey(symbol, longExpiryDate, longPeStrike, "P", date);
 
         const ceCached = masterOptionData[ceKey];
         const peCached = masterOptionData[peKey];
         const longCeCached = masterOptionData[longCeKey];
         const longPeCached = masterOptionData[longPeKey];
-        const stockCached = masterStockData[stockKey];
 
         // Backfill old cache entries that predate status metadata.
         if (ceCached && (typeof ceCached.skipFuture === "undefined" || typeof ceCached.statusCode === "undefined")) {
@@ -382,21 +1147,9 @@ const PutCalendar: React.FC = () => {
             longPeCached.openPrice !== null ||
             longPeCached.closePrice !== null)
         );
-        const stockCanUseCache = Boolean(
-          stockCached &&
-          (stockCached.openPrice !== null || stockCached.closePrice !== null)
-        );
-
         // Check localStorage cache first and call API only for misses.
         // V2 makes two additional API calls per row for long call/put values.
-        const [stockData, ceData, peData, longCeData, longPeData] = await Promise.all([
-          stockCanUseCache
-            ? Promise.resolve({
-              openPrice: stockCached?.openPrice ?? null,
-              closePrice: stockCached?.closePrice ?? null,
-              statusCode: stockCached?.statusCode ?? null,
-            })
-            : fetchStockWithRateLimitRetry(symbol, date),
+        const [ceData, peData, longCeData, longPeData] = await Promise.all([
           Promise.resolve({
             openPrice: null,
             closePrice: null,
@@ -410,6 +1163,8 @@ const PutCalendar: React.FC = () => {
               closePrice: peCached?.closePrice ?? null,
               delta: peCached?.delta ?? null,
               theta: peCached?.theta ?? null,
+              soldPrice: peCached?.soldPrice ?? null,
+              costPrice: peCached?.costPrice ?? null,
               statusCode: peCached?.statusCode ?? null,
             })
             : fetchOptionWithRateLimitRetry(symbol, expiryDate, peStrike, "P", date),
@@ -426,9 +1181,11 @@ const PutCalendar: React.FC = () => {
               closePrice: longPeCached?.closePrice ?? null,
               delta: longPeCached?.delta ?? null,
               theta: longPeCached?.theta ?? null,
+              soldPrice: longPeCached?.soldPrice ?? null,
+              costPrice: longPeCached?.costPrice ?? null,
               statusCode: longPeCached?.statusCode ?? null,
             })
-            : fetchOptionWithRateLimitRetry(symbol, longExpiryDate, peStrike, "P", date),
+            : fetchOptionWithRateLimitRetry(symbol, longExpiryDate, longPeStrike, "P", date),
         ]);
 
         if (
@@ -441,7 +1198,6 @@ const PutCalendar: React.FC = () => {
           sawRateLimit = true;
         }
 
-        const stockClosePrice = stockData.closePrice;
         const cePrice = ceData.closePrice;
         const pePrice = peData.closePrice;
         const longCePrice = longCeData.closePrice;
@@ -459,6 +1215,8 @@ const PutCalendar: React.FC = () => {
             closePrice: cePrice,
             delta: ceData.delta,
             theta: ceData.theta,
+            soldPrice: ceCached?.soldPrice ?? null,
+            costPrice: ceCached?.costPrice ?? null,
             statusCode: ceData.statusCode,
             skipFuture: shouldSkipCe,
           };
@@ -467,6 +1225,7 @@ const PutCalendar: React.FC = () => {
 
         if (!peCanUseCache) {
           const shouldSkipPe = peData.statusCode === 404;
+          const shortSoldPrice = peCached?.soldPrice ?? pePrice;
           masterOptionData[peKey] = {
             symbol,
             expiryDate,
@@ -477,6 +1236,8 @@ const PutCalendar: React.FC = () => {
             closePrice: pePrice,
             delta: peData.delta,
             theta: peData.theta,
+            soldPrice: shortSoldPrice,
+            costPrice: peData.costPrice ?? null,
             statusCode: peData.statusCode,
             skipFuture: shouldSkipPe,
           };
@@ -494,6 +1255,8 @@ const PutCalendar: React.FC = () => {
             closePrice: longCePrice,
             delta: longCeData.delta,
             theta: longCeData.theta,
+            soldPrice: longCeCached?.soldPrice ?? null,
+            costPrice: longCeCached?.costPrice ?? null,
             statusCode: longCeData.statusCode,
             skipFuture: shouldSkipLongCe,
           };
@@ -502,16 +1265,19 @@ const PutCalendar: React.FC = () => {
 
         if (!longPeCanUseCache) {
           const shouldSkipLongPe = longPeData.statusCode === 404;
+          const longCostPrice = longPeCached?.costPrice ?? longPePrice;
           masterOptionData[longPeKey] = {
             symbol,
             expiryDate: longExpiryDate,
-            strikePrice: peStrike,
+            strikePrice: longPeStrike,
             optionType: "P",
             date,
             openPrice: longPeData.openPrice,
             closePrice: longPePrice,
             delta: longPeData.delta,
             theta: longPeData.theta,
+            soldPrice: longPeData.soldPrice ?? null,
+            costPrice: longCostPrice,
             statusCode: longPeData.statusCode,
             skipFuture: shouldSkipLongPe,
           };
@@ -542,12 +1308,13 @@ const PutCalendar: React.FC = () => {
 
         const row: OptionsAnalysisRowV2 = {
           date: formatDisplayDate(date),
+          apiDate: date,
           closingPrice: stockClosePrice,
           ceStrike,
           peStrike,
           cePremiumData: cePrice !== null
             ? {
-              expiryDate: formatDisplayDate(input.expiryDate),
+              expiryDate: formatDisplayDate(activeExpiryDate),
               strike: ceStrike,
               closePrice: cePrice,
               delta: ceData.delta,
@@ -557,17 +1324,19 @@ const PutCalendar: React.FC = () => {
           markChangeCall,
           pePremiumData: pePrice !== null
             ? {
-              expiryDate: formatDisplayDate(input.expiryDate),
+              expiryDate: formatDisplayDate(activeExpiryDate),
               strike: peStrike,
               closePrice: pePrice,
               delta: peData.delta,
               theta: peData.theta,
+              soldPrice: peData.soldPrice ?? peCached?.soldPrice ?? pePrice,
+              costPrice: peData.costPrice ?? peCached?.costPrice ?? null,
             }
             : null,
           markChangePut,
           longCePremiumData: longCePrice !== null
             ? {
-              expiryDate: formatDisplayDate(input.longExpiryDate),
+              expiryDate: formatDisplayDate(resolvedLongExpiryDate),
               strike: ceStrike,
               closePrice: longCePrice,
               delta: longCeData.delta,
@@ -576,16 +1345,34 @@ const PutCalendar: React.FC = () => {
             : null,
           longPePremiumData: longPePrice !== null
             ? {
-              expiryDate: formatDisplayDate(input.longExpiryDate),
-              strike: peStrike,
+              expiryDate: formatDisplayDate(resolvedLongExpiryDate),
+              strike: longPeStrike,
               closePrice: longPePrice,
               delta: longPeData.delta,
               theta: longPeData.theta,
+              soldPrice: longPeData.soldPrice ?? longPeCached?.soldPrice ?? null,
+              costPrice: longPeData.costPrice ?? longPeCached?.costPrice ?? longPePrice,
             }
             : null,
         };
 
         rows.push(row);
+
+        setRowStrikeEntries((previous) => {
+          if (previous.some((entry) => entry.date === row.apiDate)) {
+            return previous;
+          }
+
+          return [
+            ...previous,
+            {
+              date: row.apiDate,
+              shortStrikePrice: row.peStrike,
+              longStrikePrice: row.longPePremiumData?.strike ?? longPeStrike,
+            },
+          ];
+        });
+
         // Stream rows to the table as each API response completes.
         setResult({ rows: [...rows], inputData });
 
@@ -613,6 +1400,19 @@ const PutCalendar: React.FC = () => {
       }
       if (!cancelRequested) {
         message.success(`Analysis completed for ${rows.length} dates`);
+        // Auto-trigger Phase 2 from the Phase 1 cutoff short-expiry date.
+        if (phase1CutoffShortExpiryDate) {
+          setPhaseSplitInfo({
+            phase1StartDate: inputData[0].date,
+            phase1EndDate: phase1CutoffShortExpiryDate,
+            phase2StartDate: phase1CutoffShortExpiryDate,
+          });
+          void runPhase2Analysis(
+            phase1CutoffShortExpiryDate,
+            inputData[0].symbol,
+            inputData[0].longExpiryDate
+          );
+        }
       }
     } catch (err) {
       if (!cancelRequested) {
@@ -626,6 +1426,252 @@ const PutCalendar: React.FC = () => {
     }
   };
 
+  /**
+   * Phase 2 simulation: uses lastShortExpiryDate as the new start date,
+   * re-calculates strike/expiry with the same logic and runs through to the
+   * last available trading date in the window.
+   */
+  const runPhase2Analysis = async (
+    phase1ShortExpiryDate: string,
+    symbolInput: string,
+    longExpiryDateInput: string
+  ) => {
+    const symbol = symbolInput.trim().toUpperCase();
+    let phase2StartDate = phase1ShortExpiryDate;
+
+    if (!symbol || !dayjs(phase2StartDate).isValid()) return;
+    if (!tradingDates2026.has(phase2StartDate)) {
+      let next = dayjs(phase2StartDate).add(1, "day");
+      let found = false;
+      for (let i = 0; i < 10; i++) {
+        if (tradingDates2026.has(next.format("YYYY-MM-DD"))) {
+          found = true;
+          break;
+        }
+        next = next.add(1, "day");
+      }
+      if (!found) return;
+      phase2StartDate = next.format("YYYY-MM-DD");
+    }
+
+    setPhaseLoading(true);
+    setPhaseError(null);
+    setPhaseResults([]);
+    setPhaseChartVisibility({});
+    setPhaseSelectedRowKeys({});
+
+    try {
+      const masterOptionData = loadMasterOptionData();
+      const masterStockData = loadMasterStockData();
+      let cacheUpdated = false;
+      let stockCacheUpdated = false;
+      const today = dayjs().startOf("day");
+
+      const getNextTradingDate = (date: string): string | null => {
+        let next = dayjs(date).add(1, "day");
+        for (let i = 0; i < 30; i += 1) {
+          const candidate = next.format("YYYY-MM-DD");
+          if (tradingDates2026.has(candidate)) {
+            return candidate;
+          }
+          next = next.add(1, "day");
+        }
+
+        return null;
+      };
+
+      const phaseCards: PhaseGridResult[] = [];
+
+      // Loop phase windows continuously until we run out of trading days.
+      let currentPhaseStartDate: string | null = phase2StartDate;
+      let phaseNumber = 2;
+      let cycleGuard = 0;
+      while (currentPhaseStartDate && !dayjs(currentPhaseStartDate).isAfter(today, "day") && cycleGuard < 24) {
+        cycleGuard += 1;
+
+        let p2ActiveExpiryDate: string | null = null;
+        let p2ActiveLongExpiryDate: string | null = null;
+        let p2ActiveStrikePrice: number | null = null;
+        let p2ActiveLongStrikePrice: number | null = null;
+
+        const shortExpiryCandidates = getExpiryCandidates30To45Days(currentPhaseStartDate, "");
+        p2ActiveExpiryDate = shortExpiryCandidates[0] ?? currentPhaseStartDate;
+        const phaseEnd = dayjs(p2ActiveExpiryDate).isAfter(today, "day") ? today.format("YYYY-MM-DD") : p2ActiveExpiryDate;
+
+        const phase2Dates: string[] = [];
+        let cur = dayjs(currentPhaseStartDate);
+        while (!cur.isAfter(dayjs(phaseEnd), "day")) {
+          const d = cur.format("YYYY-MM-DD");
+          if (tradingDates2026.has(d)) {
+            phase2Dates.push(d);
+          }
+          cur = cur.add(1, "day");
+        }
+
+        if (phase2Dates.length === 0) {
+          currentPhaseStartDate = getNextTradingDate(phaseEnd);
+          continue;
+        }
+
+        const currentPhaseRows: OptionsAnalysisRowV2[] = [];
+
+        for (const date of phase2Dates) {
+          const stockKey = `${symbol}|${date}`;
+          const stockCached = masterStockData[stockKey];
+          const stockCanUseCache = Boolean(
+            stockCached && (stockCached.openPrice !== null || stockCached.closePrice !== null)
+          );
+          const stockData = stockCanUseCache
+            ? { openPrice: stockCached!.openPrice, closePrice: stockCached!.closePrice, statusCode: stockCached!.statusCode }
+            : await fetchStockWithRateLimitRetry(symbol, date);
+
+          const stockClosePrice = stockData.closePrice;
+
+          if (p2ActiveStrikePrice === null) {
+            p2ActiveStrikePrice = stockClosePrice !== null
+              ? roundToNearestFive(stockClosePrice * (1 - 0.0175))
+              : 0;
+          }
+
+          if (p2ActiveLongExpiryDate === null || p2ActiveLongStrikePrice === null) {
+            const longCandidates = getExpiryCandidates100To150Days(date, longExpiryDateInput).slice(0, 4);
+            const longStrikeCandidates = [(p2ActiveStrikePrice ?? 0) - 5];
+            let found = false;
+            for (const lExpiry of longCandidates) {
+              for (const lStrike of longStrikeCandidates) {
+                const r = await fetchOptionWithRateLimitRetry(symbol, formatExpiryDate(lExpiry), lStrike, "P", date);
+                if (r.statusCode !== 404 && r.closePrice !== null) {
+                  p2ActiveLongExpiryDate = lExpiry;
+                  p2ActiveLongStrikePrice = lStrike;
+                  found = true;
+                  break;
+                }
+              }
+              if (found) break;
+            }
+            if (!found) {
+              p2ActiveLongExpiryDate = longCandidates[0] ?? (longExpiryDateInput || date);
+              p2ActiveLongStrikePrice = (p2ActiveStrikePrice ?? 0) - 5;
+            }
+          }
+
+          const expiryDateFmt = formatExpiryDate(p2ActiveExpiryDate);
+          const resolvedLongExpiryFmt = p2ActiveLongExpiryDate ?? p2ActiveExpiryDate;
+          const longExpiryDateFmt = formatExpiryDate(resolvedLongExpiryFmt);
+          const peStrike = p2ActiveStrikePrice ?? 0;
+          const longPeStrike = p2ActiveLongStrikePrice ?? peStrike;
+
+          const peKey = getCacheKey(symbol, expiryDateFmt, peStrike, "P", date);
+          const longPeKey = getCacheKey(symbol, longExpiryDateFmt, longPeStrike, "P", date);
+          const peCached = masterOptionData[peKey];
+          const longPeCached = masterOptionData[longPeKey];
+
+          const peCanUseCache = Boolean(
+            peCached && ((peCached.skipFuture && peCached.statusCode === 404) ||
+              peCached.openPrice !== null || peCached.closePrice !== null)
+          );
+          const longPeCanUseCache = Boolean(
+            longPeCached && ((longPeCached.skipFuture && longPeCached.statusCode === 404) ||
+              longPeCached.openPrice !== null || longPeCached.closePrice !== null)
+          );
+
+          const [peData, longPeData] = await Promise.all([
+            peCanUseCache
+              ? Promise.resolve({ openPrice: peCached!.openPrice, closePrice: peCached!.closePrice, delta: peCached!.delta, theta: peCached!.theta, soldPrice: peCached!.soldPrice, costPrice: peCached!.costPrice, statusCode: peCached!.statusCode })
+              : fetchOptionWithRateLimitRetry(symbol, expiryDateFmt, peStrike, "P", date),
+            longPeCanUseCache
+              ? Promise.resolve({ openPrice: longPeCached!.openPrice, closePrice: longPeCached!.closePrice, delta: longPeCached!.delta, theta: longPeCached!.theta, soldPrice: longPeCached!.soldPrice, costPrice: longPeCached!.costPrice, statusCode: longPeCached!.statusCode })
+              : fetchOptionWithRateLimitRetry(symbol, longExpiryDateFmt, longPeStrike, "P", date),
+          ]);
+
+          if (!peCanUseCache && peData.statusCode !== 429) {
+            masterOptionData[peKey] = { symbol, expiryDate: expiryDateFmt, strikePrice: peStrike, optionType: "P", date, openPrice: peData.openPrice, closePrice: peData.closePrice, delta: peData.delta, theta: peData.theta, soldPrice: peData.soldPrice ?? peCached?.soldPrice ?? null, costPrice: peData.costPrice ?? null, statusCode: peData.statusCode, skipFuture: peData.statusCode === 404 };
+            cacheUpdated = true;
+          }
+          if (!longPeCanUseCache && longPeData.statusCode !== 429) {
+            masterOptionData[longPeKey] = { symbol, expiryDate: longExpiryDateFmt, strikePrice: longPeStrike, optionType: "P", date, openPrice: longPeData.openPrice, closePrice: longPeData.closePrice, delta: longPeData.delta, theta: longPeData.theta, soldPrice: longPeData.soldPrice ?? longPeCached?.soldPrice ?? null, costPrice: longPeData.costPrice ?? longPeCached?.costPrice ?? longPeData.closePrice, statusCode: longPeData.statusCode, skipFuture: longPeData.statusCode === 404 };
+            cacheUpdated = true;
+          }
+          if (!stockCanUseCache) {
+            masterStockData[stockKey] = { symbol, date, openPrice: stockData.openPrice, closePrice: stockData.closePrice, statusCode: stockData.statusCode };
+            stockCacheUpdated = true;
+          }
+
+          let previousDate: string | null = null;
+          for (let daysBack = 1; daysBack <= 5; daysBack++) {
+            const candidate = dayjs(date).subtract(daysBack, "day").format("YYYY-MM-DD");
+            if (tradingDates2026.has(candidate)) { previousDate = candidate; break; }
+          }
+          const previousPeClose = previousDate
+            ? masterOptionData[getCacheKey(symbol, expiryDateFmt, peStrike, "P", previousDate)]?.closePrice ?? null
+            : null;
+
+          const p2Row: OptionsAnalysisRowV2 = {
+            date: formatDisplayDate(date),
+            apiDate: date,
+            closingPrice: stockClosePrice,
+            ceStrike: peStrike,
+            peStrike,
+            cePremiumData: null,
+            markChangeCall: null,
+            pePremiumData: peData.closePrice !== null
+              ? { expiryDate: formatDisplayDate(p2ActiveExpiryDate), strike: peStrike, closePrice: peData.closePrice, delta: peData.delta, theta: peData.theta, soldPrice: peData.soldPrice ?? peCached?.soldPrice ?? peData.closePrice, costPrice: peData.costPrice ?? null }
+              : null,
+            markChangePut: peData.closePrice !== null && previousPeClose !== null ? peData.closePrice - previousPeClose : null,
+            longCePremiumData: null,
+            longPePremiumData: longPeData.closePrice !== null
+              ? { expiryDate: formatDisplayDate(resolvedLongExpiryFmt), strike: longPeStrike, closePrice: longPeData.closePrice, delta: longPeData.delta, theta: longPeData.theta, soldPrice: longPeData.soldPrice ?? longPeCached?.soldPrice ?? null, costPrice: longPeData.costPrice ?? longPeCached?.costPrice ?? longPeData.closePrice }
+              : null,
+          };
+
+          currentPhaseRows.push(p2Row);
+        }
+
+        if (currentPhaseRows.length > 0) {
+          const p2InputData: OptionsInputV2[] = [{
+            symbol,
+            date: currentPhaseStartDate,
+            expiryDate: p2ActiveExpiryDate ?? "",
+            longExpiryDate: p2ActiveLongExpiryDate ?? (longExpiryDateInput ?? ""),
+            strikePrice: p2ActiveStrikePrice ?? Number.NaN,
+          }];
+
+          phaseCards.push({
+            phaseNumber,
+            startDate: currentPhaseStartDate,
+            endDate: phaseEnd,
+            analysis: {
+              rows: currentPhaseRows,
+              inputData: p2InputData,
+            },
+          });
+          setPhaseResults([...phaseCards]);
+          phaseNumber += 1;
+        }
+
+        currentPhaseStartDate = getNextTradingDate(phaseEnd);
+      }
+
+      if (phaseCards.length === 0) {
+        setPhaseError("No trading dates available for additional phases.");
+        return;
+      }
+
+      if (cacheUpdated) saveMasterOptionData(masterOptionData);
+      if (stockCacheUpdated) saveMasterStockData(masterStockData);
+      const totalRows = phaseCards.reduce((count, phase) => count + phase.analysis.rows.length, 0);
+      message.success(
+        `Additional phases completed: ${phaseCards.length} phases, ${totalRows} dates`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Additional phase analysis failed";
+      setPhaseError(msg);
+      message.error(msg);
+    } finally {
+      setPhaseLoading(false);
+    }
+  };
+
   const handleCancel = () => {
     setCancelRequested(true);
   };
@@ -633,6 +1679,14 @@ const PutCalendar: React.FC = () => {
   const handleReset = () => {
     setFormInput(DEFAULT_INPUT);
     setResult(null);
+    setPhaseResults([]);
+    setPhaseError(null);
+    setShowChart1(false);
+    setPhaseChartVisibility({});
+    setPhase1SelectedRowKeys([]);
+    setPhaseSelectedRowKeys({});
+    setPhaseSplitInfo(null);
+    setRowStrikeEntries([]);
     setError(null);
     setCancelRequested(false);
     message.success("Form reset");
@@ -658,12 +1712,47 @@ const PutCalendar: React.FC = () => {
     message.success("Option cache cleared");
   };
 
-  const handleFieldChange = <K extends keyof OptionsInputV2>(field: K, value: OptionsInputV2[K]) => {
-    setFormInput((prev) => ({
-      ...prev,
-      [field]: value,
-    }));
-  };
+  const buildNetValueChartData = (rows: OptionsAnalysisRowV2[]) =>
+    rows
+      .map((row, index) => {
+        if (!row.pePremiumData || !row.longPePremiumData) {
+          return null;
+        }
+
+        const netValue = NET_VALUE_MULTIPLIER * (
+          row.longPePremiumData.closePrice - row.pePremiumData.closePrice
+        );
+
+        const firstRow = rows[0];
+        if (!firstRow?.pePremiumData || !firstRow.longPePremiumData) {
+          return {
+            date: row.date,
+            netValue,
+            percentageChange: null,
+          };
+        }
+
+        const firstNetValue = NET_VALUE_MULTIPLIER * (
+          firstRow.longPePremiumData.closePrice - firstRow.pePremiumData.closePrice
+        );
+
+        const percentageChange =
+          index === 0 || firstNetValue === 0
+            ? 0
+            : ((netValue - firstNetValue) / firstNetValue) * 100;
+
+        return {
+          date: row.date,
+          netValue,
+          percentageChange,
+        };
+      })
+      .filter(
+        (value): value is { date: string; netValue: number; percentageChange: number | null } =>
+          value !== null
+      );
+
+  const netValueChartData = result ? buildNetValueChartData(result.rows) : [];
 
   const downloadCurrentViewAsExcel = () => {
     if (!result || result.rows.length === 0) {
@@ -688,8 +1777,10 @@ const PutCalendar: React.FC = () => {
           row.pePremiumData !== null &&
           row.longPePremiumData !== null
             ? (
-                row.longPePremiumData.closePrice -
-                row.pePremiumData.closePrice
+                NET_VALUE_MULTIPLIER * (
+                  row.longPePremiumData.closePrice -
+                  row.pePremiumData.closePrice
+                )
               ).toFixed(2)
             : "—",
         "Mark change - Put": row.markChangePut !== null ? row.markChangePut.toFixed(2) : "—",
@@ -706,7 +1797,7 @@ const PutCalendar: React.FC = () => {
     }
   };
 
-  const columns = [
+  const getColumns = (gridRows: OptionsAnalysisRowV2[]) => [
     {
       title: "Date",
       dataIndex: "date",
@@ -722,8 +1813,8 @@ const PutCalendar: React.FC = () => {
         if (value === null) return "—";
 
         let percentageChange: number | null = null;
-        if (result && result.rows.length > 0 && index !== 0) {
-          const firstRow = result.rows[0];
+        if (gridRows.length > 0 && index !== 0) {
+          const firstRow = gridRows[0];
           const firstClosePrice = firstRow.closingPrice;
           if (firstClosePrice !== null && firstClosePrice !== 0) {
             percentageChange = ((value - firstClosePrice) / firstClosePrice) * 100;
@@ -757,20 +1848,20 @@ const PutCalendar: React.FC = () => {
       dataIndex: "peStrike",
       key: "peStrike",
       width: 120,
-      render: (value: number) => (
+      render: (value: number, record: OptionsAnalysisRowV2) => (
         <Button
           type="link"
           style={{ padding: 0, height: "auto" }}
-          onClick={() => openInputPopup("Put Strike")}
+          onClick={() => openInputPopup("Put Strike", record)}
         >
           {value.toFixed(0)}
         </Button>
       ),
     },
     // {
-    //   title: "Call Premium",
-    //   dataIndex: "cePremiumData",
-    //   key: "cePremium",
+    //   title: "Put Premium",
+    //   dataIndex: "pePremiumData",
+    //   key: "pePremium",
     //   width: 200,
     //   render: (value: StrikePremium | null) => {
     //     if (!value) return "—";
@@ -787,16 +1878,7 @@ const PutCalendar: React.FC = () => {
     //     return value.toFixed(2);
     //   },
     // },
-    // {
-    //   title: "Put Premium",
-    //   dataIndex: "pePremiumData",
-    //   key: "pePremium",
-    //   width: 200,
-    //   render: (value: StrikePremium | null) => {
-    //     if (!value) return "—";
-    //     return `${value.expiryDate}-${value.strike}`;
-    //   },
-    // },
+    
     {
       title: "Sold/Short Put Price",
       dataIndex: "pePremiumData",
@@ -806,8 +1888,8 @@ const PutCalendar: React.FC = () => {
         if (!value) return "—";
 
         let percentageChange: number | null = null;
-        if (result && result.rows.length > 0 && index !== 0) {
-          const firstRow = result.rows[0];
+        if (gridRows.length > 0 && index !== 0) {
+          const firstRow = gridRows[0];
           const firstPutPrice = firstRow.pePremiumData?.closePrice ?? null;
           if (firstPutPrice !== null && firstPutPrice !== 0) {
             percentageChange = ((value.closePrice - firstPutPrice) / firstPutPrice) * 100;
@@ -829,6 +1911,16 @@ const PutCalendar: React.FC = () => {
         );
       },
     },
+    {
+      title: "Short Put Expiry Date",
+      dataIndex: "pePremiumData",
+      key: "shortPutExpiryDate",
+      width: 190,
+      render: (value: StrikePremium | null) => {
+        if (!value) return "—";
+        return value.expiryDate;
+      },
+    },
     // {
     //   title: "Mark change - Put",
     //   dataIndex: "markChangePut",
@@ -843,10 +1935,42 @@ const PutCalendar: React.FC = () => {
       title: "Bought/Long Put Price",
       dataIndex: "longPePremiumData",
       key: "longPePrice",
-      width: 140,
+      width: 200,
+      render: (value: StrikePremium | null, _record: OptionsAnalysisRowV2, index: number) => {
+        if (!value) return "—";
+
+        let percentageChange: number | null = null;
+        if (gridRows.length > 0 && index !== 0) {
+          const firstRow = gridRows[0];
+          const firstLongPutPrice = firstRow.longPePremiumData?.closePrice ?? null;
+          if (firstLongPutPrice !== null && firstLongPutPrice !== 0) {
+            percentageChange = ((value.closePrice - firstLongPutPrice) / firstLongPutPrice) * 100;
+          }
+        }
+
+        const percentageDisplay =
+          percentageChange !== null
+            ? ` (${percentageChange > 0 ? "+" : ""}${percentageChange.toFixed(2)}%)`
+            : "";
+        const percentageColor =
+          percentageChange !== null ? (percentageChange >= 0 ? "#52c41a" : "#ff4d4f") : "inherit";
+
+        return (
+          <div style={{ color: percentageColor }}>
+            {value.closePrice.toFixed(2)}
+            {percentageDisplay}
+          </div>
+        );
+      },
+    },
+    {
+      title: "Long Put Expiry Date",
+      dataIndex: "longPePremiumData",
+      key: "longPutExpiryDate",
+      width: 190,
       render: (value: StrikePremium | null) => {
         if (!value) return "—";
-        return value.closePrice.toFixed(2);
+        return `${value.expiryDate}-${value.strike}`;
       },
     },
     {
@@ -861,18 +1985,22 @@ const PutCalendar: React.FC = () => {
           return "—";
         }
 
-        const netValue = record.longPePremiumData.closePrice - record.pePremiumData.closePrice;
+        const netValue = NET_VALUE_MULTIPLIER * (
+          record.longPePremiumData.closePrice - record.pePremiumData.closePrice
+        );
 
         // Calculate percentage change from start date (first row)
         let percentageChange: number | null = null;
-        if (result && result.rows.length > 0 && index !== 0) {
-          const firstRow = result.rows[0];
+        if (gridRows.length > 0 && index !== 0) {
+          const firstRow = gridRows[0];
           if (
             firstRow.pePremiumData &&
             firstRow.longPePremiumData
           ) {
             const firstNetValue =
-              firstRow.longPePremiumData.closePrice - firstRow.pePremiumData.closePrice;
+              NET_VALUE_MULTIPLIER * (
+                firstRow.longPePremiumData.closePrice - firstRow.pePremiumData.closePrice
+              );
 
             if (firstNetValue !== 0) {
               percentageChange = ((netValue - firstNetValue) / firstNetValue) * 100;
@@ -905,18 +2033,22 @@ const PutCalendar: React.FC = () => {
           return "—";
         }
 
-        const netValue = 12*record.longPePremiumData.closePrice - 10*record.pePremiumData.closePrice;
+        const netValue = NET_VALUE_MULTIPLIER * (
+          12 * record.longPePremiumData.closePrice - 10 * record.pePremiumData.closePrice
+        );
 
         // Calculate percentage change from start date (first row)
         let percentageChange: number | null = null;
-        if (result && result.rows.length > 0 && index !== 0) {
-          const firstRow = result.rows[0];
+        if (gridRows.length > 0 && index !== 0) {
+          const firstRow = gridRows[0];
           if (
             firstRow.pePremiumData &&
             firstRow.longPePremiumData
           ) {
             const firstNetValue =
-              12*firstRow.longPePremiumData.closePrice - 10*firstRow.pePremiumData.closePrice;
+              NET_VALUE_MULTIPLIER * (
+                12 * firstRow.longPePremiumData.closePrice - 10 * firstRow.pePremiumData.closePrice
+              );
 
             if (firstNetValue !== 0) {
               percentageChange = ((netValue - firstNetValue) / firstNetValue) * 100;
@@ -949,7 +2081,7 @@ const PutCalendar: React.FC = () => {
         padding: "16px clamp(5px, 1.2vw, 10px)",
         boxSizing: "border-box",
         height: "calc(100vh - 140px)",
-        overflow: "hidden",
+        overflow: "auto",
         display: "flex",
         flexDirection: "column",
         gap: "8px",
@@ -960,63 +2092,56 @@ const PutCalendar: React.FC = () => {
           <Space direction="vertical" style={{ width: "100%" }} size="middle">
             <div>
               <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
-                Symbol
-              </label>
-              <Input
-                value={formInput.symbol}
-                onChange={(e) => handleFieldChange("symbol", e.target.value.toUpperCase())}
-                placeholder="Symbol"
-                style={{ width: "100%" }}
-                aria-label="Symbol"
-              />
-            </div>
-            <div>
-              <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
-                Strike Price
-              </label>
-              <Input
-                type="number"
-                value={String(formInput.strikePrice)}
-                onChange={(e) => handleFieldChange("strikePrice", Number(e.target.value))}
-                placeholder="Strike Price"
-                style={{ width: "100%" }}
-                aria-label="Strike Price"
-              />
-            </div>
-            <div>
-              <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
                 Date
               </label>
               <Input
                 type="date"
                 value={formInput.date}
-                onChange={(e) => handleFieldChange("date", e.target.value)}
+                onChange={(e) => {
+                  const nextDate = e.target.value;
+                  setFormInput((previous) => ({
+                    ...previous,
+                    date: nextDate,
+                  }));
+
+                  if (dateChangeTimeoutRef.current) {
+                    clearTimeout(dateChangeTimeoutRef.current);
+                  }
+
+                  dateChangeTimeoutRef.current = setTimeout(() => {
+                    void handleDateChangeAndRunSimulation(nextDate);
+                  }, 3000);
+                }}
                 style={{ width: "100%" }}
                 aria-label="Date"
               />
             </div>
             <div>
               <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
-                Expiry Date
+                Ticker
               </label>
-              <Input
-                type="date"
-                value={formInput.expiryDate}
-                onChange={(e) => handleFieldChange("expiryDate", e.target.value)}
+              <Select
+                value={formInput.symbol}
+                onChange={(value) => {
+                  setFormInput((previous) => ({
+                    ...previous,
+                    symbol: value,
+                  }));
+                }}
+                placeholder="Select ticker"
+                options={[
+                  { label: "SPY", value: "SPY" },
+                  { label: "QQQ", value: "QQQ" },
+                  { label: "MSFT", value: "MSFT" },
+                  { label: "META", value: "META" },
+                  { label: "AAPL", value: "AAPL" },
+                  { label: "GLD", value: "GLD" },
+                  { label: "UVXY", value: "UVXY" },
+                  { label: "TSLA", value: "TSLA" },
+                  { label: "NVID", value: "NVID" },
+                ]}
                 style={{ width: "100%" }}
-                aria-label="Expiry Date"
-              />
-            </div>
-            <div>
-              <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
-                Long Expiry Date
-              </label>
-              <Input
-                type="date"
-                value={formInput.longExpiryDate}
-                onChange={(e) => handleFieldChange("longExpiryDate", e.target.value)}
-                style={{ width: "100%" }}
-                aria-label="Long Expiry Date"
+                aria-label="Ticker"
               />
             </div>
 
@@ -1024,7 +2149,9 @@ const PutCalendar: React.FC = () => {
               <Button
                 type="primary"
                 icon={<PlayCircleOutlined />}
-                onClick={handleAnalyze}
+                onClick={() => {
+                  void handleAnalyze();
+                }}
                 loading={loading}
                 size="large"
                 disabled={cancelRequested}
@@ -1066,27 +2193,22 @@ const PutCalendar: React.FC = () => {
           </Space>
         </Card>
 
-        <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", gap: "8px" }}>
-          {loading && (
-            <Card style={{ textAlign: "center", flex: "0 0 auto" }}>
-              <Spin size="large" tip="Fetching option prices..." />
-            </Card>
-          )}
-
+        <div
+          style={{
+            flex: 1,
+            minWidth: 0,
+            minHeight: 0,
+            display: "flex",
+            flexDirection: "column",
+            gap: "8px",
+            overflowY: "auto",
+          }}
+        >
           {result ? (
             <Card
-              title="Analysis Results"
+              title="Phase 1"
               style={{
                 width: "100%",
-                flex: "1 1 auto",
-                minHeight: 0,
-                display: "flex",
-                flexDirection: "column",
-              }}
-              bodyStyle={{
-                display: "flex",
-                flexDirection: "column",
-                minHeight: 0,
               }}
             >
               <Space style={{ marginBottom: "16px" }}>
@@ -1099,20 +2221,37 @@ const PutCalendar: React.FC = () => {
                 <Button icon={<DownloadOutlined />} onClick={downloadCurrentViewAsExcel}>
                   Download Excel
                 </Button>
+                <Button onClick={() => setShowChart1((v) => !v)}>
+                  {showChart1 ? "Hide Chart" : "Show Chart"}
+                </Button>
               </Space>
+
+              {phaseSplitInfo && (
+                <div style={{ marginBottom: 12, fontSize: 12, color: "#595959" }}>
+                  Phase 1 Range: {formatDisplayDate(phaseSplitInfo.phase1StartDate)} to {formatDisplayDate(phaseSplitInfo.phase1EndDate)}
+                </div>
+              )}
+
+              {showChart1 && <NetValueChart data={netValueChartData} title="Put Net Value Trend" />}
 
               {result.rows.length === 0 ? (
                 <Empty description="No data to display" />
               ) : (
-                <div style={{ width: "100%", flex: 1, minHeight: 400, overflow: "hidden" }}>
+                <div style={{ width: "100%" }}>
                   <Table
-                    columns={columns}
+                    columns={getColumns(result.rows)}
                     dataSource={result.rows.map((row, idx) => ({
                       ...row,
                       key: idx,
                     }))}
+                    rowSelection={{
+                      type: "radio",
+                      selectedRowKeys: phase1SelectedRowKeys,
+                      onChange: (selectedRowKeys) => {
+                        setPhase1SelectedRowKeys(selectedRowKeys);
+                      },
+                    }}
                     pagination={{ pageSize: 50 }}
-                    scroll={{ x: "max-content", y: "calc(100vh - 320px)" }}
                     size="small"
                   />
                 </div>
@@ -1123,7 +2262,105 @@ const PutCalendar: React.FC = () => {
               <Empty description="Run analysis to view grid" />
             </Card>
           )}
+
+          {/* Additional phase grids — one card per phase cycle */}
+          {(phaseLoading || phaseError || phaseResults.length > 0) && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 16, marginTop: 16 }}>
+              {phaseError && (
+                <Alert
+                  message="Additional Phase Error"
+                  description={phaseError}
+                  type="error"
+                  showIcon
+                />
+              )}
+              {phaseResults.map((phase) => {
+                const phaseChartData = buildNetValueChartData(phase.analysis.rows);
+                const isPhaseChartVisible = phaseChartVisibility[phase.phaseNumber] ?? false;
+                return (
+                  <Card
+                    key={`phase-${phase.phaseNumber}`}
+                    title={`Phase ${phase.phaseNumber}`}
+                    style={{ width: "100%" }}
+                    bodyStyle={{ display: "flex", flexDirection: "column" }}
+                  >
+                    <Space style={{ marginBottom: 12 }}>
+                      <Button
+                        onClick={() =>
+                          setPhaseChartVisibility((previous) => ({
+                            ...previous,
+                            [phase.phaseNumber]: !isPhaseChartVisible,
+                          }))
+                        }
+                      >
+                        {isPhaseChartVisible ? "Hide Chart" : "Show Chart"}
+                      </Button>
+                    </Space>
+                    <div style={{ marginBottom: 12, fontSize: 12, color: "#595959" }}>
+                      Range: {formatDisplayDate(phase.startDate)} to {formatDisplayDate(phase.endDate)}
+                    </div>
+                    {isPhaseChartVisible && (
+                      <NetValueChart
+                        data={phaseChartData}
+                        title={`Phase ${phase.phaseNumber} – Put Net Value Trend`}
+                      />
+                    )}
+                    {phase.analysis.rows.length === 0 ? (
+                      <Empty description={`No data for Phase ${phase.phaseNumber}`} />
+                    ) : (
+                      <div style={{ width: "100%", overflowX: "auto", overflowY: "visible" }}>
+                        <Table
+                          columns={getColumns(phase.analysis.rows)}
+                          dataSource={phase.analysis.rows.map((row, idx) => ({
+                            ...row,
+                            key: `${phase.phaseNumber}-${idx}`,
+                          }))}
+                          rowSelection={{
+                            type: "radio",
+                            selectedRowKeys: phaseSelectedRowKeys[phase.phaseNumber] ?? [],
+                            onChange: (selectedRowKeys) => {
+                              setPhaseSelectedRowKeys((previous) => ({
+                                ...previous,
+                                [phase.phaseNumber]: selectedRowKeys,
+                              }));
+                            },
+                          }}
+                          pagination={{ pageSize: 50 }}
+                          scroll={{ x: "max-content" }}
+                          size="small"
+                        />
+                      </div>
+                    )}
+                  </Card>
+                );
+              })}
+            </div>
+          )}
         </div>
+      </div>
+
+      <div
+        style={{
+          position: "fixed",
+          left: "50%",
+          bottom: 20,
+          transform: "translateX(-50%)",
+          zIndex: 1100,
+        }}
+      >
+        {(loading || phaseLoading) && (
+          <div
+            style={{
+              background: "rgba(255, 255, 255, 0.95)",
+              border: "1px solid #f0f0f0",
+              borderRadius: 8,
+              padding: "8px 14px",
+              boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
+            }}
+          >
+            <Spin size="large" tip={loading ? "Fetching option prices..." : "Running additional phases..."} />
+          </div>
+        )}
       </div>
 
       <div
@@ -1157,24 +2394,135 @@ const PutCalendar: React.FC = () => {
         <Space direction="vertical" style={{ width: "100%" }} size="middle">
           <div>
             <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Symbol</label>
-            <Input value={formInput.symbol} readOnly />
+            <Input value={selectedOptionContext?.symbol ?? ""} readOnly />
           </div>
           <div>
-            <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Strike Price</label>
-            <Input value={String(formInput.strikePrice)} readOnly />
+            <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Short Put Strike Price</label>
+            <Input
+              type="number"
+              min={0}
+              placeholder="Edit short strike price"
+              value={selectedOptionContext ? String(selectedOptionContext.shortStrikePrice) : ""}
+              onChange={(event) => updatePopupStrikePrice(event.target.value, "short")}
+            />
+          </div>
+          <div>
+            <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Long Put Strike Price</label>
+            <Input
+              type="number"
+              min={0}
+              placeholder="Edit long strike price"
+              value={selectedOptionContext ? String(selectedOptionContext.longStrikePrice) : ""}
+              onChange={(event) => updatePopupStrikePrice(event.target.value, "long")}
+            />
           </div>
           <div>
             <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Date</label>
-            <Input value={formInput.date} readOnly />
+            <Input type="date" value={selectedOptionContext?.date ?? ""} onChange={(event) => updatePopupDate(event.target.value, 'date')} />
           </div>
           <div>
-            <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Expiry Date</label>
-            <Input value={formInput.expiryDate} readOnly />
+            <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Short Expiry Date</label>
+            <Select
+              style={{ width: "100%", marginBottom: 8 }}
+              value={selectedOptionContext?.expiryDate}
+              onChange={(value) => updatePopupDate(value, "expiryDate")}
+              options={[
+                {
+                  label: `Given: ${selectedOptionContext?.shortGivenExpiryDate || "N/A"}`,
+                  value: selectedOptionContext?.shortGivenExpiryDate || selectedOptionContext?.shortCalculatedExpiryDate || "",
+                  disabled: !selectedOptionContext?.shortGivenExpiryDate,
+                },
+                {
+                  label: `Calculated: ${selectedOptionContext?.shortCalculatedExpiryDate || "N/A"}`,
+                  value: selectedOptionContext?.shortCalculatedExpiryDate || "",
+                  disabled: !selectedOptionContext?.shortCalculatedExpiryDate,
+                },
+              ]}
+            />
+            <div style={{ marginBottom: 8, fontSize: "12px", color: "#666" }}>
+              <div>Selected: {selectedOptionContext?.expiryDate || "N/A"}</div>
+              <div>Given: {selectedOptionContext?.shortGivenExpiryDate || "N/A"}</div>
+              <div>Calculated: {selectedOptionContext?.shortCalculatedExpiryDate || "N/A"}</div>
+            </div>
+            <div style={{ marginBottom: 8 }}>
+              <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
+                Given Short Expiry Date Value
+              </label>
+              <Input value={selectedOptionContext?.shortGivenExpiryDate || "N/A"} readOnly />
+            </div>
+            <div style={{ marginBottom: 8 }}>
+              <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>
+                Calculated Short Expiry Date Value
+              </label>
+              <Input value={selectedOptionContext?.shortCalculatedExpiryDate || "N/A"} readOnly />
+            </div>
+            <Input type="date" value={selectedOptionContext?.expiryDate ?? ""} onChange={(event) => updatePopupDate(event.target.value, 'expiryDate')} />
           </div>
           <div>
             <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Long Expiry Date</label>
-            <Input value={formInput.longExpiryDate} readOnly />
+            <Select
+              style={{ width: "100%", marginBottom: 8 }}
+              value={selectedOptionContext?.longExpiryDate}
+              onChange={(value) => updatePopupDate(value, "longExpiryDate")}
+              options={[
+                {
+                  label: `Given: ${selectedOptionContext?.longGivenExpiryDate || "N/A"}`,
+                  value: selectedOptionContext?.longGivenExpiryDate || selectedOptionContext?.longCalculatedExpiryDate || "",
+                  disabled: !selectedOptionContext?.longGivenExpiryDate,
+                },
+                {
+                  label: `Calculated: ${selectedOptionContext?.longCalculatedExpiryDate || "N/A"}`,
+                  value: selectedOptionContext?.longCalculatedExpiryDate || "",
+                  disabled: !selectedOptionContext?.longCalculatedExpiryDate,
+                },
+              ]}
+            />
+            <div style={{ marginBottom: 8, fontSize: "12px", color: "#666" }}>
+              <div>Selected: {selectedOptionContext?.longExpiryDate || "N/A"}</div>
+              <div>Given: {selectedOptionContext?.longGivenExpiryDate || "N/A"}</div>
+              <div>Calculated: {selectedOptionContext?.longCalculatedExpiryDate || "N/A"}</div>
+            </div>
+            <Input type="date" value={selectedOptionContext?.longExpiryDate ?? ""} onChange={(event) => updatePopupDate(event.target.value, 'longExpiryDate')} />
           </div>
+          <div>
+            <Space>
+              <Button
+                type="primary"
+                onClick={handleFetchOptionDetails}
+                loading={optionDetailsLoading}
+                disabled={!selectedOptionContext}
+              >
+                Get Option Details
+              </Button>
+              <Button
+                onClick={() => {
+                  void updateStrikePriceAndRefreshRow();
+                }}
+                loading={optionDetailsLoading}
+                disabled={!selectedOptionContext || !result}
+              >
+                Update Strike
+              </Button>
+            </Space>
+          </div>
+          {optionDetails && (
+            <div style={{ backgroundColor: "#f5f5f5", borderRadius: "4px", padding: "10px" }}>
+              <div>Status: {optionDetails.statusCode ?? "N/A"}</div>
+              <div>Open: {optionDetails.openPrice !== null ? optionDetails.openPrice.toFixed(2) : "—"}</div>
+              <div>Close: {optionDetails.closePrice !== null ? optionDetails.closePrice.toFixed(2) : "—"}</div>
+              <div>Delta: {optionDetails.delta !== null ? optionDetails.delta.toFixed(4) : "—"}</div>
+              <div>Theta: {optionDetails.theta !== null ? optionDetails.theta.toFixed(4) : "—"}</div>
+            </div>
+          )}
+          {!optionDetails && !optionDetailsLoading && (
+            <div style={{ color: "#888", fontSize: "12px" }}>
+              Click "Get Option Details" to load option open/close and greeks.
+            </div>
+          )}
+          {/* <div> */}
+            {/* <label style={{ display: "block", marginBottom: "6px", fontSize: "12px" }}>Long Expiry Date</label> */}
+            {/* <Input value={formInput.longExpiryDate} readOnly /> */}
+          {/* </div> */}
         </Space>
       </Modal>
     </div>

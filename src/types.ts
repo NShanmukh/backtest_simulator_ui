@@ -73,6 +73,8 @@ export interface StrikePremium {
   closePrice: number;
   delta?: number | null;
   theta?: number | null;
+  soldPrice?: number | null;
+  costPrice?: number | null;
 }
 
 /** Result row for options analyzer table */

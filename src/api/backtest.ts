@@ -10,6 +10,8 @@ export interface OptionOpenClose {
   closePrice: number | null;
   delta: number | null;
   theta: number | null;
+  soldPrice?: number | null;
+  costPrice?: number | null;
   statusCode: number | null;
 }
 

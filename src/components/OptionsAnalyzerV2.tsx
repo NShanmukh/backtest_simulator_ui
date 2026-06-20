@@ -27,6 +27,7 @@ import dayjs from "dayjs";
 import * as XLSX from "xlsx";
 import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
 import tradingDates2026Json from "../assets/trading_dates_2026.json";
+import NetValueChart from "./NetValueChart";
 import type {
   OptionsInput,
   OptionsAnalysisRow,
@@ -79,6 +80,7 @@ const MASTER_STOCK_DATA_KEY = "masterStockData";
 const tradingDates2026 = new Set<string>(tradingDates2026Json as string[]);
 const RATE_LIMIT_WAIT_MS = 2_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
+const NET_VALUE_MULTIPLIER = 10;
 const DEFAULT_INPUT: OptionsInputV2 = {
   expiryDate: "2026-06-30",
   longExpiryDate: "2026-12-31",
@@ -661,6 +663,59 @@ const OptionsAnalyzerV2: React.FC = () => {
     message.success("Local cache cleared");
   };
 
+  const netValueChartData = result
+    ? result.rows
+        .map((row, index) => {
+          if (
+            !row.cePremiumData ||
+            !row.pePremiumData ||
+            !row.longCePremiumData ||
+            !row.longPePremiumData
+          ) {
+            return null;
+          }
+
+          const totalValue = row.cePremiumData.closePrice + row.pePremiumData.closePrice;
+          const longTotalValue =
+            row.longCePremiumData.closePrice + row.longPePremiumData.closePrice;
+          const netValue = NET_VALUE_MULTIPLIER * (longTotalValue - totalValue);
+
+          const firstRow = result.rows[0];
+          if (
+            !firstRow?.cePremiumData ||
+            !firstRow.pePremiumData ||
+            !firstRow.longCePremiumData ||
+            !firstRow.longPePremiumData
+          ) {
+            return {
+              date: row.date,
+              netValue,
+              percentageChange: null,
+            };
+          }
+
+          const firstTotalValue = firstRow.cePremiumData.closePrice + firstRow.pePremiumData.closePrice;
+          const firstLongTotalValue =
+            firstRow.longCePremiumData.closePrice + firstRow.longPePremiumData.closePrice;
+          const firstNetValue = NET_VALUE_MULTIPLIER * (firstLongTotalValue - firstTotalValue);
+
+          const percentageChange =
+            index === 0 || firstNetValue === 0
+              ? 0
+              : ((netValue - firstNetValue) / firstNetValue) * 100;
+
+          return {
+            date: row.date,
+            netValue,
+            percentageChange,
+          };
+        })
+        .filter(
+          (value): value is { date: string; netValue: number; percentageChange: number | null } =>
+            value !== null
+        )
+    : [];
+
   const handleFieldChange = <K extends keyof OptionsInputV2>(field: K, value: OptionsInputV2[K]) => {
     setFormInput((prev) => ({
       ...prev,
@@ -706,9 +761,11 @@ const OptionsAnalyzerV2: React.FC = () => {
           row.longCePremiumData !== null &&
           row.longPePremiumData !== null
             ? (
-                row.longCePremiumData.closePrice +
-                row.longPePremiumData.closePrice -
-                (row.cePremiumData.closePrice + row.pePremiumData.closePrice)
+                NET_VALUE_MULTIPLIER * (
+                  row.longCePremiumData.closePrice +
+                  row.longPePremiumData.closePrice -
+                  (row.cePremiumData.closePrice + row.pePremiumData.closePrice)
+                )
               ).toFixed(2)
             : "—",
         "Mark change - Put": row.markChangePut !== null ? row.markChangePut.toFixed(2) : "—",
@@ -937,7 +994,7 @@ const OptionsAnalyzerV2: React.FC = () => {
         const totalValue = record.cePremiumData.closePrice + record.pePremiumData.closePrice;
         const longTotalValue =
           record.longCePremiumData.closePrice + record.longPePremiumData.closePrice;
-        const netValue = longTotalValue - totalValue;
+        const netValue = NET_VALUE_MULTIPLIER * (longTotalValue - totalValue);
 
         // Calculate percentage change from start date (first row)
         let percentageChange: number | null = null;
@@ -953,7 +1010,7 @@ const OptionsAnalyzerV2: React.FC = () => {
               firstRow.cePremiumData.closePrice + firstRow.pePremiumData.closePrice;
             const firstLongTotalValue =
               firstRow.longCePremiumData.closePrice + firstRow.longPePremiumData.closePrice;
-            const firstNetValue = firstLongTotalValue - firstTotalValue;
+            const firstNetValue = NET_VALUE_MULTIPLIER * (firstLongTotalValue - firstTotalValue);
 
             if (firstNetValue !== 0) {
               percentageChange = ((netValue - firstNetValue) / firstNetValue) * 100;
@@ -1104,6 +1161,8 @@ const OptionsAnalyzerV2: React.FC = () => {
               Download Excel
             </Button>
           </Space>
+
+          <NetValueChart data={netValueChartData} />
 
           {result.rows.length === 0 ? (
             <Empty description="No data to display" />

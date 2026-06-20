@@ -14,6 +14,9 @@ import OptionsAnalyzer from "./components/OptionsAnalyzer";
 import OptionsAnalyzerV2 from "./components/OptionsAnalyzerV2";
 import PutCalendar from "./components/PutCalendar";
 import CallCalendar from "./components/CallCalendar";
+import InterestCalculator from "./components/InterestCalculator";
+import CoveredCall from "./components/CoveredCall";
+import CoveredPut from "./components/CoveredPut";
 import { runBacktest } from "./api/backtest";
 import type { BacktestRequest, BacktestResponse } from "./types";
 
@@ -124,6 +127,21 @@ const App: React.FC = () => {
                 key: "options-analyser-v2",
                 label: "Option Analyser V2",
                 children: <OptionsAnalyzerV2 />,
+              },
+              {
+                key: "interest-calculator",
+                label: "Interest Calculator",
+                children: <InterestCalculator />,
+              },
+              {
+                key: "covered-call",
+                label: "Covered Call",
+                children: <CoveredCall />,
+              },
+              {
+                key: "covered-put",
+                label: "Covered Put",
+                children: <CoveredPut />,
               },
               {
                 key: "put-calendar",
