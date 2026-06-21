@@ -59,6 +59,22 @@ interface PhaseGridResult {
   analysis: AnalysisResult;
 }
 
+interface PhaseSummaryRow {
+  key: string;
+  phaseLabel: string;
+  startDate: string;
+  endDate: string;
+  startStockPrice: number | null;
+  endStockPrice: number | null;
+  stockPercentageChange: number | null;
+  startNetValue: number | null;
+  endPhaseNetValue: number | null;
+  totalNetValue: number | null;
+  cumulativeTotalNetValue: number | null;
+  totalNetValue12L10S: number | null;
+  cumulativeTotalNetValue12L10S: number | null;
+}
+
 interface SelectedOptionContext {
   symbol: string;
   date: string;
@@ -113,11 +129,11 @@ const tradingDates2026 = new Set<string>(tradingDates2026Json as string[]);
 const RATE_LIMIT_WAIT_MS = 2_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const NET_VALUE_MULTIPLIER = 10;
-const LONG_EXPIRY_MIN_DTE_DAYS = 100;
-const LONG_EXPIRY_MAX_DTE_DAYS = 150;
+const LONG_EXPIRY_MIN_DTE_DAYS = 70;
+const LONG_EXPIRY_MAX_DTE_DAYS = 120;
 const DEFAULT_INPUT: OptionsInputV2 = {
   expiryDate: "",
-  longExpiryDate: "2026-12-31",
+  longExpiryDate: "",
   date: "2026-01-01",
   strikePrice: 700,
   symbol: "SPY",
@@ -179,7 +195,7 @@ const PutCalendar: React.FC = () => {
       ? formInput.longExpiryDate
       : "";
     const longCalculatedExpiryDate =
-      getExpiryCandidates100To150Days(record.apiDate, formInput.longExpiryDate)[0] ?? record.apiDate;
+      getExpiryCandidates70To120Days(record.apiDate, formInput.longExpiryDate)[0] ?? record.apiDate;
 
     const nextOptionContext: SelectedOptionContext = {
       symbol: formInput.symbol.trim().toUpperCase(),
@@ -312,7 +328,7 @@ const PutCalendar: React.FC = () => {
     }
 
     if (!isLongExpiryInRange(activeOptionContext.date, activeOptionContext.longExpiryDate)) {
-      message.error("Long expiry date must be more than 100 and up to 150 days from date");
+      message.error("Long expiry date must be 70 to 120 days from date");
       return;
     }
 
@@ -602,7 +618,7 @@ const PutCalendar: React.FC = () => {
 
   const isLongExpiryInRange = (baseDate: string, longExpiryDate: string): boolean => {
     const dteDays = getLongExpiryDteDays(baseDate, longExpiryDate);
-    return dteDays > LONG_EXPIRY_MIN_DTE_DAYS && dteDays <= LONG_EXPIRY_MAX_DTE_DAYS;
+    return dteDays >= LONG_EXPIRY_MIN_DTE_DAYS && dteDays <= LONG_EXPIRY_MAX_DTE_DAYS;
   };
 
   const isProvidedStrikePrice = (value: number): boolean => {
@@ -667,7 +683,7 @@ const PutCalendar: React.FC = () => {
     return candidates;
   };
 
-  const getExpiryCandidates100To150Days = (baseDate: string, preferredExpiryDate: string): string[] => {
+  const getExpiryCandidates70To120Days = (baseDate: string, preferredExpiryDate: string): string[] => {
     const start = dayjs(baseDate).add(LONG_EXPIRY_MIN_DTE_DAYS, "day");
     const end = dayjs(baseDate).add(LONG_EXPIRY_MAX_DTE_DAYS, "day");
 
@@ -676,7 +692,7 @@ const PutCalendar: React.FC = () => {
         const candidate = dayjs(candidateDate);
         return (
           candidate.isValid() &&
-          candidate.isAfter(start, "day") &&
+          (candidate.isAfter(start, "day") || candidate.isSame(start, "day")) &&
           (candidate.isBefore(end, "day") || candidate.isSame(end, "day"))
         );
       })
@@ -729,7 +745,7 @@ const PutCalendar: React.FC = () => {
 
       const strikeCandidates = getStrikeCandidatesFromClose(closePrice);
       const expiryCandidates = getExpiryCandidates30To45Days(normalizedDate, formInput.expiryDate);
-      const longExpiryCandidates = getExpiryCandidates100To150Days(normalizedDate, formInput.longExpiryDate).slice(0, 4);
+      const longExpiryCandidates = getExpiryCandidates70To120Days(normalizedDate, formInput.longExpiryDate).slice(0, 4);
       const longStrikeCandidatesFromClose = getLongPutRetryStrikeCandidatesFromClose(closePrice);
 
       let resolvedStrikePrice = strikeCandidates[0] ?? formInput.strikePrice;
@@ -873,8 +889,9 @@ const PutCalendar: React.FC = () => {
 
     if (normalizedInput.longExpiryDate) {
       const dteDays = getLongExpiryDteDays(normalizedInput.date, normalizedInput.longExpiryDate);
-      if (dteDays <= LONG_EXPIRY_MIN_DTE_DAYS || dteDays > LONG_EXPIRY_MAX_DTE_DAYS) {
-        throw new Error("Long expiry date must be 101 to 150 days after date");
+      if (dteDays < LONG_EXPIRY_MIN_DTE_DAYS || dteDays > LONG_EXPIRY_MAX_DTE_DAYS) {
+        // Fall back to auto-selected long expiry in the configured DTE window.
+        normalizedInput.longExpiryDate = "";
       }
     }
 
@@ -1042,7 +1059,7 @@ const PutCalendar: React.FC = () => {
         const ceStrike = peStrike;
 
         if (activeLongExpiryDate === null || activeLongStrikePrice === null) {
-          const longExpiryCandidates = getExpiryCandidates100To150Days(date, input.longExpiryDate).slice(0, 4);
+          const longExpiryCandidates = getExpiryCandidates70To120Days(date, input.longExpiryDate).slice(0, 4);
           const longStrikeCandidates = [peStrike - 5];
 
           let longFound = false;
@@ -1534,7 +1551,7 @@ const PutCalendar: React.FC = () => {
           }
 
           if (p2ActiveLongExpiryDate === null || p2ActiveLongStrikePrice === null) {
-            const longCandidates = getExpiryCandidates100To150Days(date, longExpiryDateInput).slice(0, 4);
+            const longCandidates = getExpiryCandidates70To120Days(date, longExpiryDateInput).slice(0, 4);
             const longStrikeCandidates = [(p2ActiveStrikePrice ?? 0) - 5];
             let found = false;
             for (const lExpiry of longCandidates) {
@@ -1751,6 +1768,277 @@ const PutCalendar: React.FC = () => {
         (value): value is { date: string; netValue: number; percentageChange: number | null } =>
           value !== null
       );
+
+  const getRowNetValue = (row: OptionsAnalysisRowV2): number | null => {
+    if (!row.pePremiumData || !row.longPePremiumData) {
+      return null;
+    }
+
+    return NET_VALUE_MULTIPLIER * (row.longPePremiumData.closePrice - row.pePremiumData.closePrice);
+  };
+
+  const getRowNetValue12L10S = (row: OptionsAnalysisRowV2): number | null => {
+    if (!row.pePremiumData || !row.longPePremiumData) {
+      return null;
+    }
+
+    return 12 * row.longPePremiumData.closePrice - 10 * row.pePremiumData.closePrice;
+  };
+
+  const buildPhaseSummaryRow = (
+    phaseLabel: string,
+    rows: OptionsAnalysisRowV2[],
+    startDate: string,
+    endDate: string
+  ): PhaseSummaryRow => {
+    const firstStockRow = rows.find((row) => row.closingPrice !== null) ?? null;
+    const lastStockRow = [...rows].reverse().find((row) => row.closingPrice !== null) ?? null;
+    const firstNetValueRow = rows.find((row) => getRowNetValue(row) !== null) ?? null;
+    const lastNetValueRow = [...rows].reverse().find((row) => getRowNetValue(row) !== null) ?? null;
+    const firstNetValue12L10SRow = rows.find((row) => getRowNetValue12L10S(row) !== null) ?? null;
+    const lastNetValue12L10SRow = [...rows].reverse().find((row) => getRowNetValue12L10S(row) !== null) ?? null;
+    const startStockPrice = firstStockRow?.closingPrice ?? null;
+    const endStockPrice = lastStockRow?.closingPrice ?? null;
+    const startNetValue = firstNetValueRow ? getRowNetValue(firstNetValueRow) : null;
+    const endPhaseNetValue = lastNetValueRow ? getRowNetValue(lastNetValueRow) : null;
+    const startNetValue12L10S = firstNetValue12L10SRow ? getRowNetValue12L10S(firstNetValue12L10SRow) : null;
+    const endPhaseNetValue12L10S = lastNetValue12L10SRow ? getRowNetValue12L10S(lastNetValue12L10SRow) : null;
+    const stockPercentageChange =
+      startStockPrice !== null && endStockPrice !== null && startStockPrice !== 0
+        ? ((endStockPrice - startStockPrice) / startStockPrice) * 100
+        : null;
+    const totalNetValue =
+      startNetValue !== null && endPhaseNetValue !== null
+        ? endPhaseNetValue - startNetValue
+        : null;
+    const totalNetValue12L10S =
+      startNetValue12L10S !== null && endPhaseNetValue12L10S !== null
+        ? endPhaseNetValue12L10S - startNetValue12L10S
+        : null;
+
+    return {
+      key: phaseLabel,
+      phaseLabel,
+      startDate,
+      endDate,
+      startStockPrice,
+      endStockPrice,
+      stockPercentageChange,
+      startNetValue,
+      endPhaseNetValue,
+      totalNetValue,
+      cumulativeTotalNetValue: null,
+      totalNetValue12L10S,
+      cumulativeTotalNetValue12L10S: null,
+    };
+  };
+
+  const phaseSummaryRows: PhaseSummaryRow[] = [];
+  if (result && result.rows.length > 0) {
+    phaseSummaryRows.push(
+      buildPhaseSummaryRow(
+        "Phase 1",
+        result.rows,
+        result.rows[0]?.apiDate ?? result.inputData[0]?.date ?? "",
+        result.rows[result.rows.length - 1]?.apiDate ?? result.inputData[0]?.date ?? ""
+      )
+    );
+  }
+
+  for (const phase of phaseResults) {
+    if (phase.analysis.rows.length === 0) {
+      continue;
+    }
+    phaseSummaryRows.push(
+      buildPhaseSummaryRow(
+        `Phase ${phase.phaseNumber}`,
+        phase.analysis.rows,
+        phase.startDate,
+        phase.endDate
+      )
+    );
+  }
+
+  let cumulativeNetValue = 0;
+  let cumulativeNetValue12L10S = 0;
+  const phaseSummaryRowsWithCumulative: PhaseSummaryRow[] = phaseSummaryRows.map((row) => {
+    const nextCumulative = row.totalNetValue !== null
+      ? (cumulativeNetValue += row.totalNetValue, cumulativeNetValue)
+      : null;
+    const nextCumulative12L10S = row.totalNetValue12L10S !== null
+      ? (cumulativeNetValue12L10S += row.totalNetValue12L10S, cumulativeNetValue12L10S)
+      : null;
+    return {
+      ...row,
+      cumulativeTotalNetValue: nextCumulative,
+      cumulativeTotalNetValue12L10S: nextCumulative12L10S,
+    };
+  });
+
+  const sumNullableValues = (values: Array<number | null>): number | null => {
+    const numericValues = values.filter((value): value is number => value !== null);
+    if (numericValues.length === 0) {
+      return null;
+    }
+    return numericValues.reduce((sum, value) => sum + value, 0);
+  };
+
+  const phaseSummaryTotalsRow: PhaseSummaryRow = {
+    key: "phase-summary-total",
+    phaseLabel: "Total",
+    startDate: "",
+    endDate: "",
+    startStockPrice: null,
+    endStockPrice: null,
+    stockPercentageChange: sumNullableValues(
+      phaseSummaryRowsWithCumulative.map((row) => row.stockPercentageChange)
+    ),
+    startNetValue: sumNullableValues(
+      phaseSummaryRowsWithCumulative.map((row) => row.startNetValue)
+    ),
+    endPhaseNetValue: sumNullableValues(
+      phaseSummaryRowsWithCumulative.map((row) => row.endPhaseNetValue)
+    ),
+    totalNetValue: sumNullableValues(
+      phaseSummaryRowsWithCumulative.map((row) => row.totalNetValue)
+    ),
+    cumulativeTotalNetValue: null,
+    totalNetValue12L10S: null,
+    cumulativeTotalNetValue12L10S: null,
+  };
+
+  const phaseSummaryRowsForTable: PhaseSummaryRow[] = [
+    ...phaseSummaryRowsWithCumulative,
+    phaseSummaryTotalsRow,
+  ];
+
+  const phaseSummaryColumns = [
+    {
+      title: "Phase",
+      dataIndex: "phaseLabel",
+      key: "phaseLabel",
+      width: 110,
+    },
+    {
+      title: "Start Date",
+      dataIndex: "startDate",
+      key: "startDate",
+      width: 120,
+      render: (value: string) => (value ? formatDisplayDate(value) : "—"),
+    },
+    {
+      title: "End Date",
+      dataIndex: "endDate",
+      key: "endDate",
+      width: 120,
+      render: (value: string) => (value ? formatDisplayDate(value) : "—"),
+    },
+    {
+      title: "Start Stock",
+      dataIndex: "startStockPrice",
+      key: "startStockPrice",
+      width: 130,
+      render: (value: number | null) => (value === null ? "—" : value.toFixed(2)),
+    },
+    {
+      title: "End Stock",
+      dataIndex: "endStockPrice",
+      key: "endStockPrice",
+      width: 130,
+      render: (value: number | null) => (value === null ? "—" : value.toFixed(2)),
+    },
+    {
+      title: "Stock % Change",
+      dataIndex: "stockPercentageChange",
+      key: "stockPercentageChange",
+      width: 150,
+      render: (value: number | null) => {
+        if (value === null) {
+          return "—";
+        }
+        const color = value >= 0 ? "#52c41a" : "#ff4d4f";
+        return <span style={{ color }}>{`${value > 0 ? "+" : ""}${value.toFixed(2)}%`}</span>;
+      },
+    },
+    {
+      title: "Start Net Value",
+      dataIndex: "startNetValue",
+      key: "startNetValue",
+      width: 170,
+      render: (value: number | null) => {
+        if (value === null) {
+          return "—";
+        }
+        const color = value >= 0 ? "#52c41a" : "#ff4d4f";
+        return <span style={{ color }}>{value.toFixed(2)}</span>;
+      },
+    },
+    {
+      title: "End Phase Net Value",
+      dataIndex: "endPhaseNetValue",
+      key: "endPhaseNetValue",
+      width: 190,
+      render: (value: number | null) => {
+        if (value === null) {
+          return "—";
+        }
+        const color = value >= 0 ? "#52c41a" : "#ff4d4f";
+        return <span style={{ color }}>{value.toFixed(2)}</span>;
+      },
+    },
+    {
+      title: "Total Net Value",
+      dataIndex: "totalNetValue",
+      key: "totalNetValue",
+      width: 170,
+      render: (value: number | null) => {
+        if (value === null) {
+          return "—";
+        }
+        const color = value >= 0 ? "#52c41a" : "#ff4d4f";
+        return <span style={{ color }}>{value.toFixed(2)}</span>;
+      },
+    },
+    {
+      title: "Cumulative Total Net Value",
+      dataIndex: "cumulativeTotalNetValue",
+      key: "cumulativeTotalNetValue",
+      width: 240,
+      render: (value: number | null) => {
+        if (value === null) {
+          return "—";
+        }
+        const color = value >= 0 ? "#52c41a" : "#ff4d4f";
+        return <span style={{ color }}>{value.toFixed(2)}</span>;
+      },
+    },
+    {
+      title: "Total Net Value (12L-10S)",
+      dataIndex: "totalNetValue12L10S",
+      key: "totalNetValue12L10S",
+      width: 220,
+      render: (value: number | null) => {
+        if (value === null) {
+          return "—";
+        }
+        const color = value >= 0 ? "#52c41a" : "#ff4d4f";
+        return <span style={{ color }}>{value.toFixed(2)}</span>;
+      },
+    },
+    {
+      title: "Cumulative Net Value (12L-10S)",
+      dataIndex: "cumulativeTotalNetValue12L10S",
+      key: "cumulativeTotalNetValue12L10S",
+      width: 260,
+      render: (value: number | null) => {
+        if (value === null) {
+          return "—";
+        }
+        const color = value >= 0 ? "#52c41a" : "#ff4d4f";
+        return <span style={{ color }}>{value.toFixed(2)}</span>;
+      },
+    },
+  ];
 
   const netValueChartData = result ? buildNetValueChartData(result.rows) : [];
 
@@ -2023,7 +2311,7 @@ const PutCalendar: React.FC = () => {
       },
     }, {
       title: "Net Value- 12L-10S",
-      key: "netValue",
+      key: "netValue12L10S",
       width: 180,
       render: (_value: unknown, record: OptionsAnalysisRowV2, index: number) => {
         if (
@@ -2033,9 +2321,8 @@ const PutCalendar: React.FC = () => {
           return "—";
         }
 
-        const netValue = NET_VALUE_MULTIPLIER * (
-          12 * record.longPePremiumData.closePrice - 10 * record.pePremiumData.closePrice
-        );
+        const netValue =
+          12 * record.longPePremiumData.closePrice - 10 * record.pePremiumData.closePrice;
 
         // Calculate percentage change from start date (first row)
         let percentageChange: number | null = null;
@@ -2046,9 +2333,7 @@ const PutCalendar: React.FC = () => {
             firstRow.longPePremiumData
           ) {
             const firstNetValue =
-              NET_VALUE_MULTIPLIER * (
-                12 * firstRow.longPePremiumData.closePrice - 10 * firstRow.pePremiumData.closePrice
-              );
+              12 * firstRow.longPePremiumData.closePrice - 10 * firstRow.pePremiumData.closePrice;
 
             if (firstNetValue !== 0) {
               percentageChange = ((netValue - firstNetValue) / firstNetValue) * 100;
@@ -2204,6 +2489,18 @@ const PutCalendar: React.FC = () => {
             overflowY: "auto",
           }}
         >
+          {phaseSummaryRows.length > 0 && (
+            <Card title="Phase Summary" style={{ width: "100%" }}>
+              <Table
+                columns={phaseSummaryColumns}
+                dataSource={phaseSummaryRowsForTable}
+                pagination={false}
+                size="small"
+                scroll={{ x: "max-content" }}
+              />
+            </Card>
+          )}
+
           {result ? (
             <Card
               title="Phase 1"

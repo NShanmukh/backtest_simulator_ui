@@ -1025,7 +1025,7 @@ const CallCalendar: React.FC = () => {
       },
     }, {
       title: "Net Value- 12L-10S",
-      key: "netValue",
+      key: "netValue12L10S",
       width: 180,
       render: (_value: unknown, record: OptionsAnalysisRowV2, index: number) => {
         if (
@@ -1035,9 +1035,8 @@ const CallCalendar: React.FC = () => {
           return "—";
         }
 
-        const netValue = NET_VALUE_MULTIPLIER * (
-          12 * record.longCePremiumData.closePrice - 10 * record.cePremiumData.closePrice
-        );
+        const netValue =
+          12 * record.longCePremiumData.closePrice - 10 * record.cePremiumData.closePrice;
 
         // Calculate percentage change from start date (first row)
         let percentageChange: number | null = null;
@@ -1048,9 +1047,7 @@ const CallCalendar: React.FC = () => {
             firstRow.longCePremiumData
           ) {
             const firstNetValue =
-              NET_VALUE_MULTIPLIER * (
-                12 * firstRow.longCePremiumData.closePrice - 10 * firstRow.cePremiumData.closePrice
-              );
+              12 * firstRow.longCePremiumData.closePrice - 10 * firstRow.cePremiumData.closePrice;
 
             if (firstNetValue !== 0) {
               percentageChange = ((netValue - firstNetValue) / firstNetValue) * 100;
